@@ -256,28 +256,79 @@ kubectl -n <namespace> port-forward svc/<postgres-svc> 5433:5432
 - Host: `localhost`, Port: `5433`
 - Database / Username / Password: from your controller app credentials secret
 
+## Phase 4: Eliminate PostgreSQL (Replace pg_notify)
+
+Phase 4 replaces PostgreSQL's `pg_notify`/`LISTEN`/`NOTIFY` with a SQL Server notification bus, allowing complete removal of the PostgreSQL dependency.
+
+### Architecture: Hybrid Polling Table + Service Broker Signal
+
+pg_notify is pub/sub (all listeners see every message), but Service Broker queues are single-consumer (RECEIVE removes messages). Since `tower_settings_change` is consumed by both dispatcherd AND cache_clear, we use a hybrid approach:
+
+- **Polling table** (`awx_notify_messages`): durable, multi-consumer message log. Each consumer tracks its own `last_seen_id`.
+- **Service Broker** (`AwxSignalQueue`): lightweight wake-up signal. After INSERT, publisher SEND a signal; consumers block on `WAITFOR RECEIVE` instead of busy-polling.
+
+### Three codepaths replaced
+
+| Codepath | Original | Replacement |
+|----------|----------|-------------|
+| Dispatcherd task dispatch | `dispatcherd.brokers.pg_notify` (psycopg `LISTEN`/`NOTIFY`) | `awx.main.dispatch.brokers.service_broker` (new broker module) |
+| AWX PubSub (ws_heartbeat, cache_clear, rsyslog) | `awx.main.dispatch.PubSub` (raw psycopg) | `ServiceBrokerPubSub` (monkey-patched via conf.d) |
+| WebSocket relay | `awx.main.wsrelay` (psycopg `AsyncConnection`) | Patched `run()` method (monkey-patched via conf.d) |
+
+### Step 1: Create notification bus objects
+
+Run `scripts/setup_notification_bus.sql` against the SQL Server `awx` database. This creates the polling table and Service Broker objects.
+
+### Step 2: Deploy the broker module
+
+Copy `awx/main/dispatch/brokers/service_broker.py` and `awx/main/dispatch/brokers/__init__.py` into the controller container. If using Skaffold, add a fragment that copies these into the image.
+
+### Step 3: Deploy extended mssql-confd.py
+
+The updated `mssql-confd.py` includes Phase 4 patches that:
+- Swap the dispatcherd broker from `pg_notify` to `service_broker`
+- Replace `PubSub`, `pg_bus_conn`, `create_listener_connection` with SQL Server equivalents
+- Replace `WebSocketRelayManager.run()` to use SQL Server instead of psycopg
+- Stub the `dispatcherd.brokers.pg_notify` import in `prefork.py`
+- Bypass the `connection.vendor != 'postgresql'` check in `apps.py`
+
+### Step 4: Stop PostgreSQL and verify
+
+```bash
+# Scale down PostgreSQL
+kubectl -n <namespace> scale deployment <postgres-deployment> --replicas=0
+
+# Or, point DATABASES['default'] at SQL Server too
+```
+
+Verify Controller still operates: jobs dispatch, events record, WebSocket relay works.
+
 ## File Reference
 
 | File | Description |
 |------|-------------|
-| `mssql-confd.py` | Full conf.d configuration (router, monkey-patches, signal handlers) |
+| `mssql-confd.py` | Full conf.d configuration (router, ORM patches, dispatch patches) |
 | `Dockerfile.fragment` | Container build fragment for ODBC driver + Python packages |
 | `scripts/fix_schema_gaps.sql` | SQL to fix schema gaps from faked migrations |
 | `scripts/migrate_pg_to_mssql.py` | Data migration script (PG to MSSQL, run in-pod) |
+| `scripts/setup_notification_bus.sql` | SQL setup for polling table + Service Broker objects |
+| `awx/main/dispatch/brokers/service_broker.py` | Dispatcherd broker implementing the Broker Protocol |
+| `awx/main/dispatch/brokers/__init__.py` | Package init |
 
 ## Known Limitations
 
-- **pg_notify**: PostgreSQL is still required for dispatcherd's `pg_notify` real-time event dispatch. This is a raw `psycopg` connection, not ORM.
 - **Partitioning**: SQL Server does not support PostgreSQL-style table partitioning. Migration 0144 is faked; event tables are unpartitioned.
 - **Resource registry**: `dab_resource_registry_resource` migration has a UUID column size mismatch. Non-critical, skipped.
 - **periodic_resource_sync**: Fails with 401 to Gateway. Pre-existing issue, unrelated to SQL Server.
 - **mssql-django maintenance**: The `mssql-django` package (1.7.3) is community-maintained. Production use would require evaluation of long-term support.
+- **Notification latency**: Service Broker signal provides near-instant delivery, but falls back to 250ms polling on signal failures.
+- **DATABASES['default']**: Django requires a `default` database entry. After killing PG, `default` may need to point at SQL Server too.
 
 ## Monkey-Patch Rationale
 
 AWX assumes PostgreSQL throughout. Rather than modifying AWX source code, this POC uses runtime monkey-patches loaded via Django's `conf.d` settings mechanism. This approach:
 
-1. **Zero AWX source changes** - the fork is identical to upstream
+1. **Zero AWX source changes** - the fork is identical to upstream (broker module is the only new file)
 2. **Fully reversible** - remove `mssql.py` from conf.d to revert to PostgreSQL-only
 3. **Isolates SQL Server concerns** - all MSSQL-specific logic lives in one configuration file
 
@@ -286,3 +337,6 @@ The patches address these PostgreSQL-specific assumptions:
 - `advisory_lock` uses PostgreSQL advisory locks - replaced with no-op
 - `bulk_create(ignore_conflicts=True)` generates PostgreSQL `ON CONFLICT DO NOTHING` - replaced with row-by-row insert
 - `_update_host_metrics` uses Django ORM upsert pattern that breaks SQL Server transaction state - replaced with raw SQL `IF NOT EXISTS/INSERT` + `UPDATE`
+- `pg_notify`/`LISTEN`/`NOTIFY` - replaced with polling table + Service Broker signal
+- `PubSub` class - replaced with `ServiceBrokerPubSub` using pyodbc
+- `WebSocketRelayManager` - replaced with Service Broker polling loop
