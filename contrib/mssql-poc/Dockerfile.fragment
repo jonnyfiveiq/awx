@@ -1,0 +1,10 @@
+# Container fragment: Install MSSQL ODBC driver and Python packages
+# Add this to the controller task/web container build
+USER 0
+
+RUN curl -s https://packages.microsoft.com/config/rhel/9.0/prod.repo > /etc/yum.repos.d/mssql-release.repo && \
+    microdnf install -y unixODBC unixODBC-devel && \
+    ACCEPT_EULA=Y microdnf install -y msodbcsql18 && \
+    microdnf clean all
+
+RUN /var/lib/awx/venv/awx/bin/pip install --no-deps mssql-django==1.7.3 pyodbc==5.0.1
