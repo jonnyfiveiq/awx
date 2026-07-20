@@ -1,0 +1,20 @@
+# Container fragment: Install MSSQL ODBC driver and Python packages for Gateway
+# Build: docker build -f Dockerfile.gateway -t localhost:5001/aap27/gateway-rhel9:2.7-mssql .
+# Then: kubectl set image deployment/myaap-gateway api=localhost:5001/aap27/gateway-rhel9:2.7-mssql -n aap27
+USER 0
+
+RUN curl -s https://packages.microsoft.com/config/rhel/9.0/prod.repo > /etc/yum.repos.d/mssql-release.repo && \
+    microdnf install -y unixODBC unixODBC-devel && \
+    ACCEPT_EULA=Y microdnf install -y msodbcsql18 && \
+    microdnf clean all
+
+RUN /opt/aap-gateway/venv/bin/pip install --no-deps mssql-django==1.7.3 pyodbc==5.3.0
+
+# Install shared MSSQL library
+RUN mkdir -p /opt/mssql-poc
+COPY lib/mssql_common.py /opt/mssql-poc/mssql_common.py
+
+# Install service broker dispatcherd module
+COPY ../awx/main/dispatch/brokers/service_broker.py /tmp/service_broker.py
+
+USER 1000

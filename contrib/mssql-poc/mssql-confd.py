@@ -1,103 +1,27 @@
-# MS SQL Server dual-database configuration for AAP Controller
+# MS SQL Server configuration for AAP Controller
 # Loaded via /etc/tower/conf.d/mssql.py (AWX settings glob)
-# ANSTRAT-1887 Phase 3: Route ALL ORM traffic to SQL Server
+# ANSTRAT-1887 Phase 3+4: Route ALL ORM traffic to SQL Server + notification bus
+#
+# Requires: mssql_common.py installed at /opt/mssql-poc/mssql_common.py
 import os
+import sys
+sys.path.insert(0, '/opt/mssql-poc')
 
-# --- SQL Server database connection ---
-DATABASES['mssql'] = {
-    'ENGINE': 'mssql',
-    'NAME': 'awx',
-    'USER': 'SA',
-    'PASSWORD': os.environ.get('MSSQL_SA_PASSWORD', 'AAP_P0C_Password_2026!'),
-    'HOST': 'host.docker.internal',
-    'PORT': '1433',
-    'OPTIONS': {
-        'driver': 'ODBC Driver 18 for SQL Server',
-        'extra_params': 'TrustServerCertificate=yes',
-    },
-    'ATOMIC_REQUESTS': True,
-}
+from mssql_common import apply_orm_patches, get_sb_broker_config, stub_pg_notify
 
-from django.db.backends.signals import connection_created
+# =============================================================================
+# Phase 3: ORM routing — all Django ORM reads/writes go to SQL Server
+# =============================================================================
 
-def _mssql_connection_init(sender, connection, **kwargs):
-    if connection.alias == 'mssql':
-        with connection.cursor() as cursor:
-            cursor.execute("SET XACT_ABORT OFF")
+DATABASE_ROUTERS = apply_orm_patches(DATABASES, db_name='awx')
 
-connection_created.connect(_mssql_connection_init, weak=False)
-
-# --- Database Router: ALL ORM → mssql, PG stays for pg_notify only ---
-class MSSQLRouter:
-    def db_for_read(self, model, **hints):
-        return 'mssql'
-
-    def db_for_write(self, model, **hints):
-        return 'mssql'
-
-    def allow_relation(self, obj1, obj2, **hints):
-        return True
-
-    def allow_migrate(self, db, app_label, model_name=None, **hints):
-        if db == 'mssql':
-            return False
-        return None
-
-
-DATABASE_ROUTERS = [MSSQLRouter()]
-
-# --- Monkey-patch: advisory_lock no-op for SQL Server ---
-from contextlib import contextmanager
-
-
-@contextmanager
-def _mssql_advisory_lock_noop(name, wait=False, lock_session_timeout_milliseconds=None):
-    yield True
-
-
-import ansible_base.lib.utils.db as _db_utils
-_db_utils.advisory_lock = _mssql_advisory_lock_noop
-
-# --- Monkey-patch: transaction.atomic() defaults to 'mssql' instead of 'default' ---
-import django.db.transaction as _tx
-_orig_atomic = _tx.atomic
-
-class _MSSQLAtomicWrapper:
-    def __new__(cls, using=None, *args, **kwargs):
-        if using is None:
-            using = 'mssql'
-        return _orig_atomic(using, *args, **kwargs)
-
-_tx.atomic = _MSSQLAtomicWrapper
-
-_orig_on_commit = _tx.on_commit
-
-def _mssql_on_commit(func, using=None, robust=False):
-    if using is None:
-        using = 'mssql'
-    return _orig_on_commit(func, using=using, robust=robust)
-
-_tx.on_commit = _mssql_on_commit
-
-# --- Monkey-patch: bulk_create(ignore_conflicts=True) for SQL Server ---
-from django.db.models.query import QuerySet as _QS
-_orig_bulk_create = _QS.bulk_create
-
-
-def _mssql_bulk_create(self, objs, *args, ignore_conflicts=False, **kwargs):
-    if ignore_conflicts and self.db == 'mssql':
-        created = []
-        for obj in objs:
-            try:
-                created.extend(_orig_bulk_create(self, [obj], *args, **kwargs))
-            except Exception:
-                pass
-        return created
-    return _orig_bulk_create(self, objs, *args, ignore_conflicts=ignore_conflicts, **kwargs)
-
-_QS.bulk_create = _mssql_bulk_create
+# --- Controller-specific: HostMetric upsert patch ---
+# AWX uses ON CONFLICT DO UPDATE for host metrics, which is PG-only.
+# This replaces it with IF NOT EXISTS / UPDATE for SQL Server.
 
 import logging as _logging
+from django.db.backends.signals import connection_created
+
 _mssql_logger = _logging.getLogger('awx.main.mssql')
 
 def _mssql_patched_update_host_metrics(updated_hosts_list):
@@ -154,8 +78,11 @@ connection_created.connect(_apply_host_metrics_patch, weak=False)
 import json as _json
 import asyncio as _asyncio
 from collections import namedtuple as _namedtuple
+from contextlib import contextmanager
 
-_SBNotification = _namedtuple('SBNotification', ['channel', 'payload'])
+stub_pg_notify()
+
+_SB_BROKER_CONFIG = get_sb_broker_config(db_name='awx')
 
 _MSSQL_CONN_STR = (
     "DRIVER={ODBC Driver 18 for SQL Server};"
@@ -166,14 +93,7 @@ _MSSQL_CONN_STR = (
     "TrustServerCertificate=yes;"
 )
 
-_SB_BROKER_CONFIG = {
-    'server': 'host.docker.internal,1433',
-    'database': 'awx',
-    'user': 'SA',
-    'password': os.environ.get('MSSQL_SA_PASSWORD', 'AAP_P0C_Password_2026!'),
-    'driver': 'ODBC Driver 18 for SQL Server',
-    'TrustServerCertificate': 'yes',
-}
+_SBNotification = _namedtuple('SBNotification', ['channel', 'payload'])
 
 
 def _sb_create_connection():
@@ -181,39 +101,47 @@ def _sb_create_connection():
     return pyodbc.connect(_MSSQL_CONN_STR, autocommit=True)
 
 
-# --- A. Monkey-patch get_dispatcherd_config: swap pg_notify → service_broker ---
-
-import awx.main.dispatch.config as _dispatch_config
-_orig_get_dispatcherd_config = _dispatch_config.get_dispatcherd_config
-
-
-def _mssql_get_dispatcherd_config(for_service=False, mock_publish=False):
-    config = _orig_get_dispatcherd_config(for_service=for_service, mock_publish=mock_publish)
-    if not mock_publish:
-        config['brokers'].pop('pg_notify', None)
-        config['brokers']['awx.main.dispatch.brokers.service_broker'] = {
-            'config': _SB_BROKER_CONFIG.copy(),
-            'default_publish_channel': config.get('brokers', {}).get('pg_notify', {}).get(
-                'default_publish_channel', CLUSTER_HOST_ID
-            ) if 'pg_notify' in config.get('brokers', {}) else CLUSTER_HOST_ID,
-        }
-        config['publish']['default_broker'] = 'awx.main.dispatch.brokers.service_broker'
-        if for_service:
-            from awx.main.dispatch import get_task_queuename
-            config['brokers']['awx.main.dispatch.brokers.service_broker']['channels'] = [
-                'tower_broadcast_all', 'tower_settings_change', get_task_queuename()
-            ]
-    return config
-
-
-_dispatch_config.get_dispatcherd_config = _mssql_get_dispatcherd_config
-
-
-# --- B. Monkey-patch configure_dispatcherd: don't check connection.vendor ---
+# --- Controller-specific: Deferred dispatch patches ---
+# awx.main.dispatch.config and awx.main.dispatch CANNOT be imported at
+# settings load time: dispatch/__init__.py triggers settings loading,
+# creating a circular import. We install a replacement
+# configure_dispatcherd() that runs during AppConfig.ready().
 
 import awx.main.apps as _apps_mod
 
+_dispatch_patches_state = {'applied': False}
+
 def _mssql_configure_dispatcherd(self):
+    if not _dispatch_patches_state['applied']:
+        _dispatch_patches_state['applied'] = True
+
+        import awx.main.dispatch.config as _dispatch_config
+        _orig_get_dispatcherd_config = _dispatch_config.get_dispatcherd_config
+
+        def _mssql_get_dispatcherd_config(for_service=False, mock_publish=False):
+            config = _orig_get_dispatcherd_config(for_service=for_service, mock_publish=mock_publish)
+            if not mock_publish:
+                config['brokers'].pop('pg_notify', None)
+                config['brokers']['awx.main.dispatch.brokers.service_broker'] = {
+                    'config': _SB_BROKER_CONFIG.copy(),
+                    'default_publish_channel': CLUSTER_HOST_ID,
+                }
+                config['publish']['default_broker'] = 'awx.main.dispatch.brokers.service_broker'
+                if for_service:
+                    from awx.main.dispatch import get_task_queuename
+                    config['brokers']['awx.main.dispatch.brokers.service_broker']['channels'] = [
+                        'tower_broadcast_all', 'tower_settings_change', get_task_queuename()
+                    ]
+            return config
+
+        _dispatch_config.get_dispatcherd_config = _mssql_get_dispatcherd_config
+
+        # Replace PubSub, pg_bus_conn, create_listener_connection
+        import awx.main.dispatch as _dispatch_mod
+        _dispatch_mod.PubSub = _ServiceBrokerPubSub
+        _dispatch_mod.pg_bus_conn = _sb_pg_bus_conn
+        _dispatch_mod.create_listener_connection = _sb_create_connection
+
     from awx.main.dispatch.config import get_dispatcherd_config
     from dispatcherd.config import setup as dispatcher_setup
     config_dict = get_dispatcherd_config()
@@ -222,18 +150,7 @@ def _mssql_configure_dispatcherd(self):
 _apps_mod.MainConfig.configure_dispatcherd = _mssql_configure_dispatcherd
 
 
-# --- C. Monkey-patch prefork.py: stub pg_notify import ---
-
-import sys as _sys
-import types as _types
-
-if 'dispatcherd.brokers.pg_notify' not in _sys.modules:
-    _stub = _types.ModuleType('dispatcherd.brokers.pg_notify')
-    _stub.__file__ = '<stub for mssql poc>'
-    _sys.modules['dispatcherd.brokers.pg_notify'] = _stub
-
-
-# --- D. Replace PubSub class and pg_bus_conn ---
+# --- Controller-specific: PubSub replacement class ---
 
 class _ServiceBrokerPubSub:
     def __init__(self, conn, select_timeout=None):
@@ -252,7 +169,7 @@ class _ServiceBrokerPubSub:
         try:
             cursor.execute(
                 "INSERT INTO awx_notify_messages (channel, payload) VALUES (?, ?)",
-                channel, payload
+                [channel, payload]
             )
             try:
                 cursor.execute("""
@@ -284,12 +201,12 @@ class _ServiceBrokerPubSub:
                 cursor.execute(
                     "WAITFOR (RECEIVE TOP(1) conversation_handle, message_type_name "
                     "FROM [AwxSignalQueue]), TIMEOUT ?",
-                    self.select_timeout * 1000
+                    [self.select_timeout * 1000]
                 )
                 row = cursor.fetchone()
                 if row:
                     try:
-                        cursor.execute("END CONVERSATION ?", row[0])
+                        cursor.execute("END CONVERSATION ?", [row[0]])
                     except Exception:
                         pass
                 cursor.close()
@@ -307,7 +224,7 @@ class _ServiceBrokerPubSub:
             cursor.execute(
                 f"SELECT id, channel, payload FROM awx_notify_messages "
                 f"WHERE id > ? AND channel IN ({placeholders}) ORDER BY id",
-                last_seen, *self._listening_channels
+                [last_seen] + list(self._listening_channels)
             )
             rows = cursor.fetchall()
             cursor.close()
@@ -337,19 +254,21 @@ def _sb_pg_bus_conn(new_connection=False, select_timeout=None):
         pass
 
 
-import awx.main.dispatch as _dispatch_mod
-_dispatch_mod.PubSub = _ServiceBrokerPubSub
-_dispatch_mod.pg_bus_conn = _sb_pg_bus_conn
-_dispatch_mod.create_listener_connection = _sb_create_connection
+# --- Controller-specific: WebSocketRelayManager patch ---
 
+_wsrelay_patch_state = {'applied': False}
 
-# --- E. Patch WebSocketRelayManager to use SQL Server instead of psycopg ---
+def _apply_wsrelay_patch(sender, connection, **kwargs):
+    if _wsrelay_patch_state['applied']:
+        return
+    _wsrelay_patch_state['applied'] = True
+    import awx.main.wsrelay as _wsrelay_mod
+    _wsrelay_mod.WebSocketRelayManager.run = _sb_wsrelay_run
 
-import awx.main.wsrelay as _wsrelay_mod
+connection_created.connect(_apply_wsrelay_patch, weak=False)
 
 
 async def _sb_on_ws_heartbeat_loop(mgr):
-    """Service Broker replacement for WebSocketRelayManager.on_ws_heartbeat"""
     import pyodbc
 
     conn = _sb_create_connection()
@@ -366,12 +285,13 @@ async def _sb_on_ws_heartbeat_loop(mgr):
             c = conn.cursor()
             c.execute(
                 "WAITFOR (RECEIVE TOP(1) conversation_handle, message_type_name "
-                "FROM [AwxSignalQueue]), TIMEOUT 30000"
+                "FROM [AwxSignalQueue]), TIMEOUT ?",
+                [30000]
             )
             row = c.fetchone()
             if row:
                 try:
-                    c.execute("END CONVERSATION ?", row[0])
+                    c.execute("END CONVERSATION ?", [row[0]])
                 except Exception:
                     pass
             c.close()
@@ -383,7 +303,7 @@ async def _sb_on_ws_heartbeat_loop(mgr):
         c.execute(
             "SELECT id, channel, payload FROM awx_notify_messages "
             "WHERE id > ? AND channel = ? ORDER BY id",
-            last_seen, 'web_ws_heartbeat'
+            [last_seen, 'web_ws_heartbeat']
         )
         rows = c.fetchall()
         c.close()
@@ -418,11 +338,7 @@ async def _sb_on_ws_heartbeat_loop(mgr):
                 await mgr.cleanup_offline_host(hostname)
 
 
-_orig_wsrelay_run = _wsrelay_mod.WebSocketRelayManager.run
-
-
 async def _sb_wsrelay_run(self):
-    """Replacement run() that uses SQL Server instead of psycopg"""
     from awx.main.wsrelay import RelayWebsocketStatsManager, WebsocketRelayConnection
 
     self.stats_mgr = RelayWebsocketStatsManager(self.local_hostname)
@@ -467,6 +383,3 @@ async def _sb_wsrelay_run(self):
 
         from django.conf import settings as _settings
         await _asyncio.sleep(_settings.BROADCAST_WEBSOCKET_NEW_INSTANCE_POLL_RATE_SECONDS)
-
-
-_wsrelay_mod.WebSocketRelayManager.run = _sb_wsrelay_run

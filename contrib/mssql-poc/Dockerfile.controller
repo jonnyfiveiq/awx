@@ -1,0 +1,21 @@
+FROM localhost:5001/aap27/controller-rhel9:2.7
+
+USER 0
+
+RUN curl -s https://packages.microsoft.com/config/rhel/9.0/prod.repo > /etc/yum.repos.d/mssql-release.repo && \
+    microdnf install -y unixODBC unixODBC-devel && \
+    ACCEPT_EULA=Y microdnf install -y msodbcsql18 && \
+    microdnf clean all
+
+RUN /var/lib/awx/venv/awx/bin/pip install --no-deps mssql-django==1.7.3 pyodbc==5.3.0 pytz
+
+# Shared MSSQL library
+RUN mkdir -p /opt/mssql-poc
+COPY lib/mssql_common.py /opt/mssql-poc/mssql_common.py
+
+# Service broker dispatcherd module — install into controller's dispatch package
+RUN mkdir -p /src/controller/awx/main/dispatch/brokers && \
+    touch /src/controller/awx/main/dispatch/brokers/__init__.py
+COPY service_broker.py /src/controller/awx/main/dispatch/brokers/service_broker.py
+
+USER 1000
