@@ -528,7 +528,45 @@ curl -s -X POST http://localhost:44927/api/gateway/v1/login/ \
 
 ---
 
-## Part 4: Service Cluster Data Sync
+## Part 4: Service Cluster Data Sync (Restoring Envoy Routing)
+
+### Why This Step Exists — The Failure Sequence
+
+When controller is deployed on MSSQL first (Part 2), everything works: controller serves its own API, and gateway routes traffic to controller through Envoy using service cluster data in PostgreSQL.
+
+When you then move **gateway** to MSSQL (Part 3), the `MSSQLRouter` redirects **all** gateway ORM queries — including the Envoy xDS control plane — to SQL Server. The xDS endpoints (`/v3/discovery:clusters`, `/v3/discovery:listeners`) now query the `aap_gateway` MSSQL database for service cluster data. But that data was only ever in PostgreSQL, so the MSSQL tables are empty. This causes:
+
+1. **`RelatedObjectDoesNotExist`** errors in xDS views — the xDS queries hit empty MSSQL tables and fail on FK lookups
+2. **Envoy returns empty cluster/listener config** — no upstream clusters defined, so Envoy can't route to controller, hub, or EDA
+3. **Controller disappears from the gateway UI** — the platform UI shows no services because Envoy has no routes
+4. **`/api/controller/` returns 503** — Envoy has no cluster definition for the controller upstream
+
+The fix is to ensure the service cluster data exists in the MSSQL `aap_gateway` database before (or immediately after) switching gateway to MSSQL.
+
+### Compounding Issue: Controller Image Revert
+
+During gateway deployment, if controller pods bounce (e.g. from a rollout restart or resource pressure), the controller deployment may revert to the **base image** (`controller-rhel9:2.7`) instead of the MSSQL image (`controller-rhel9:2.7-mssql`). This happens if the deployment spec wasn't updated with `kubectl set image` (only the running pod was using the MSSQL image).
+
+Symptoms when controller runs the wrong image:
+- `ModuleNotFoundError: No module named 'awx.main.dispatch.brokers'` — broker module isn't in the base image
+- `AttributeError: module 'dispatcherd.brokers.pg_notify' has no attribute 'Broker'` — pg_notify stub is empty because `service_broker.Broker` can't be imported
+- Dispatcher crash-loops, jobs fail to launch
+
+**Always verify** both deployment image specs match the MSSQL tag:
+```bash
+# Check controller deployments
+kubectl get deploy myaap-controller-task myaap-controller-web -n aap27 \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.template.spec.containers[*].image}{"\n"}{end}'
+
+# Should show 2.7-mssql, not 2.7
+# Fix if wrong:
+kubectl set image deployment/myaap-controller-task \
+  controller-task=localhost:5001/aap27/controller-rhel9:2.7-mssql -n aap27
+kubectl set image deployment/myaap-controller-web \
+  controller-web=localhost:5001/aap27/controller-rhel9:2.7-mssql -n aap27
+```
+
+### Service Cluster Data
 
 After gateway is on MSSQL, the Envoy xDS endpoints must return valid cluster and listener config. This requires the service cluster data (which services exist and how to route to them) to be present in MSSQL.
 
@@ -809,7 +847,8 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
-| **Image reverted after pod bounce** | Errors about missing modules | Always verify deployment image after pod restart: `kubectl get deploy -o jsonpath='{.spec.template.spec.containers[*].image}'` |
+| **Gateway MSSQL breaks controller routing** | Controller disappears from UI, `/api/controller/` returns 503, xDS returns `RelatedObjectDoesNotExist` | Service cluster data must be synced to MSSQL before/after gateway switchover — xDS queries now hit MSSQL not PG (see Part 4) |
+| **Controller image reverts to base** | `ModuleNotFoundError: No module named 'awx.main.dispatch.brokers'`, dispatcher crash-loops | Deployment spec wasn't updated — use `kubectl set image` to persist the `2.7-mssql` tag in the deployment, not just the running pod. Verify with `kubectl get deploy -o jsonpath='{.spec.template.spec.containers[*].image}'` |
 | **FK constraint ordering** | `DELETE conflicted with REFERENCE constraint` | Delete in order: serviceapiroute → additionalroute → route → servicekey → servicenode → httpport → servicecluster |
 | **Gateway login is form-encoded** | 403 or redirect to login page | POST to `/api/gateway/v1/login/` with `Content-Type: application/x-www-form-urlencoded` and CSRF token, not JSON |
 | **cache-clear psycopg error** | `psycopg.errors.UndefinedTable: relation "awx_notify_messages"` | Non-critical — `run_cache_clear` imports `pg_bus_conn` before deferred patch fires. Self-recovers on restart |
