@@ -2,7 +2,7 @@
 
 **ANSTRAT-1887: Bring Your Own Database (BYOD) - MS SQL Server**
 
-This guide covers running the full AAP platform (Controller + Gateway) with ALL ORM traffic on Microsoft SQL Server, with PostgreSQL completely eliminated. It documents a working deployment proven on a Kind cluster with AAP 2.7.
+This guide covers running the full AAP platform (Controller + Gateway + EDA) with ALL ORM traffic on Microsoft SQL Server, with PostgreSQL completely eliminated. It documents a working deployment proven on a Kind cluster with AAP 2.7.
 
 ## Table of Contents
 
@@ -12,8 +12,9 @@ This guide covers running the full AAP platform (Controller + Gateway) with ALL 
 - [Part 1: SQL Server Setup](#part-1-sql-server-setup)
 - [Part 2: Controller on MSSQL](#part-2-controller-on-mssql)
 - [Part 3: Gateway on MSSQL](#part-3-gateway-on-mssql)
-- [Part 4: Service Cluster Data Sync](#part-4-service-cluster-data-sync)
-- [Part 5: End-to-End Verification](#part-5-end-to-end-verification)
+- [Part 4: EDA on MSSQL](#part-4-eda-on-mssql)
+- [Part 5: Service Cluster Data Sync](#part-5-service-cluster-data-sync)
+- [Part 6: End-to-End Verification](#part-6-end-to-end-verification)
 - [Shared Library: mssql_common.py](#shared-library-mssql_commonpy)
 - [Notification Bus Architecture](#notification-bus-architecture)
 - [Monkey-Patch Rationale](#monkey-patch-rationale)
@@ -23,7 +24,7 @@ This guide covers running the full AAP platform (Controller + Gateway) with ALL 
 
 ## Architecture
 
-Both Controller and Gateway run entirely on SQL Server. PostgreSQL is eliminated.
+All three AAP components — Controller, Gateway, and EDA — run entirely on SQL Server. PostgreSQL is eliminated.
 
 ```
                          ┌──────────────────────────────┐
@@ -45,19 +46,26 @@ Both Controller and Gateway run entirely on SQL Server. PostgreSQL is eliminated
                          │  │   awx    │ │aap_gateway│   │
                          │  │(controller)│(gateway)  │   │
                          │  └──────────┘ └──────────┘   │
+                         │  ┌──────────┐                │
+                         │  │   eda    │                │
+                         │  │ (eda)    │                │
+                         │  └──────────┘                │
                          └───────────────────────────────┘
                                   │
-                         ┌────────┴─────────────────────┐
-                         │    AAP Controller Pods        │
-                         │  (task + web)                 │
-                         ├──────────────────────────────┤
-                         │  Django ORM    dispatcherd    │
-                         │  (all models)  + PubSub       │
-                         │       │        + wsrelay      │
-                         │  MSSQLRouter   (service_broker)│
-                         │       ▼              │       │
-                         │     mssql ◄──────────┘       │
-                         └──────────────────────────────┘
+                    ┌─────────────┴─────────────────────┐
+                    │                                   │
+           ┌────────┴─────────────────┐  ┌──────────────┴──────────┐
+           │  AAP Controller Pods     │  │    EDA Pods              │
+           │  (task + web)            │  │  (api + workers +        │
+           ├──────────────────────────┤  │   event-stream)          │
+           │  Django ORM  dispatcherd │  ├──────────────────────────┤
+           │  (all models) + PubSub   │  │  Django ORM  dispatcherd │
+           │       │       + wsrelay  │  │  (all models) (svc_broker)│
+           │  MSSQLRouter (svc_broker)│  │       │           │     │
+           │       ▼          │      │  │  MSSQLRouter       │     │
+           │     mssql ◄──────┘      │  │       ▼            ▼     │
+           └──────────────────────────┘  │     mssql ◄───────┘     │
+                                         └──────────────────────────┘
 ```
 
 ### Notification Bus (replaces pg_notify)
@@ -100,10 +108,12 @@ These values were used in the proven deployment. Adjust as needed.
 | SQL Server SA password | `AAP_P0C_Password_2026!` |
 | Controller database | `awx` |
 | Gateway database | `aap_gateway` |
+| EDA database | `eda` |
 | AAP admin password | `r9hwurZIPH1U9FlUWl2SuZMOUnGuBIY6` |
 | Controller base image | `localhost:5001/aap27/controller-rhel9:2.7` |
 | Gateway base image | `localhost:5001/aap27/gateway-rhel9:2.7` |
-| MSSQL image tag | `2.7-mssql` |
+| EDA base image | `localhost:5001/aap27/eda-controller-rhel9:2.7` |
+| MSSQL image tag | `2.7-mssql` (controller/gateway), `2.7-mssql-v11` (EDA) |
 | Kind cluster runtime | Podman |
 | External gateway port | `44927` |
 | Gateway session cookie | `gateway_sessionid44927` |
@@ -136,15 +146,21 @@ podman exec mssql /opt/mssql-tools18/bin/sqlcmd \
 podman exec mssql /opt/mssql-tools18/bin/sqlcmd \
   -S localhost -U SA -P 'AAP_P0C_Password_2026!' \
   -C -Q "CREATE DATABASE aap_gateway"
+
+# EDA database (or use scripts/setup_eda_db.sql which creates both DB and Service Broker)
+podman exec mssql /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U SA -P 'AAP_P0C_Password_2026!' \
+  -C -Q "CREATE DATABASE eda"
 ```
 
 ### 1.3 Set Up Notification Bus
 
-Run the notification bus setup SQL for **both** databases. The scripts create the polling table (`awx_notify_messages`) and Service Broker objects:
+Run the notification bus setup SQL for **all three** databases. The scripts create the polling table (`awx_notify_messages`) and Service Broker objects:
 
 ```bash
 # Controller (awx database) — scripts/setup_notification_bus.sql
 # Gateway (aap_gateway database) — scripts/setup_gateway_db.sql
+# EDA (eda database) — scripts/setup_eda_db.sql
 ```
 
 Each script creates:
@@ -157,7 +173,7 @@ Each script creates:
 
 | Target | Host | Port | Database | User | Password |
 |--------|------|------|----------|------|----------|
-| SQL Server | `localhost` | `1433` | `awx` or `aap_gateway` | `SA` | `AAP_P0C_Password_2026!` |
+| SQL Server | `localhost` | `1433` | `awx`, `aap_gateway`, or `eda` | `SA` | `AAP_P0C_Password_2026!` |
 | PostgreSQL | `localhost` | `5433` (via port-forward) | from Secret | from Secret | from Secret |
 
 ```bash
@@ -528,7 +544,258 @@ curl -s -X POST http://localhost:44927/api/gateway/v1/login/ \
 
 ---
 
-## Part 4: Service Cluster Data Sync (Restoring Envoy Routing)
+## Part 4: EDA on MSSQL
+
+### 4.1 Build the EDA MSSQL Image
+
+```bash
+cd contrib/mssql-poc
+podman build -f Dockerfile.eda -t localhost:5001/aap27/eda-controller-rhel9:2.7-mssql .
+podman push localhost:5001/aap27/eda-controller-rhel9:2.7-mssql
+```
+
+`Dockerfile.eda` is structurally identical to the controller/gateway Dockerfiles but targets EDA's paths:
+1. Installs ODBC Driver 18 via Microsoft's RHEL 9 repo
+2. Installs `mssql-django==1.7.3`, `pyodbc==5.3.0`, and `pytz` into system Python (`/usr/bin/pip3`)
+3. Copies `lib/mssql_common.py`, `service_broker.py`, and `eda-mssql-settings.py` to `/opt/mssql-poc/`
+
+Key difference from controller/gateway: EDA uses system Python 3.12 (no virtualenv), and all MSSQL files go to `/opt/mssql-poc/` on `PYTHONPATH` rather than into a component-specific dispatch/brokers directory.
+
+### 4.2 Settings Injection (Dynaconf)
+
+EDA uses **Dynaconf** for settings, not Django's conf.d mechanism (controller) or appended settings.py (gateway). The injection approach:
+
+1. `eda-mssql-settings.py` is a wrapper settings module that:
+   - Does `from aap_eda.settings.default import *` (triggers full Dynaconf chain)
+   - Overrides DATABASES via `mssql_common.apply_orm_patches()`
+   - Stubs `dispatcherd.brokers.pg_notify` and registers the Service Broker
+   - Patches `CoreConfig.ready()` to configure dispatcherd with Service Broker
+   - Patches the `dispatcherd` management command to use Service Broker config
+   - Patches `list_requests()` to replace `DISTINCT ON` with `Min()` + `GROUP BY`
+
+2. Deploy via environment variables on all 4 EDA deployments:
+   - `DJANGO_SETTINGS_MODULE=eda_mssql_settings`
+   - `PYTHONPATH=/opt/mssql-poc`
+
+This modifies **zero** EDA source files.
+
+### 4.3 EDA-Specific Patches
+
+| Patch | Purpose |
+|-------|---------|
+| `apply_orm_patches(DATABASES, db_name='eda')` | ORM routing, UUID fix, advisory lock noop, transaction patches (shared library) |
+| `_PgNotifyStubBroker` | pg_notify stub with Broker class that delegates to Service Broker |
+| `DISPATCHERD_DEFAULT_SETTINGS` | Override dispatcherd config to use `service_broker` instead of `pg_notify` |
+| `DISPATCHERD_DEFAULT_WORKER_SETTINGS` | DefaultWorker-specific config with scheduled producers |
+| `_mssql_eda_ready()` | Replacement `CoreConfig.ready()` that configures dispatcherd and patches DISTINCT ON |
+| `_mssql_dispatcherd_handle()` | Replacement dispatcherd management command handler for ActivationWorker/DefaultWorker |
+| `_mssql_list_requests()` | Replaces `DISTINCT ON` (PG-only) in `activation_request_queue.list_requests()` |
+| `install_textfield_index_patch()` | Caps TextField to `nvarchar(450)` for MSSQL index compatibility |
+
+#### DISTINCT ON Patch (EDA-Specific)
+
+EDA's `activation_request_queue.list_requests()` uses `.distinct("process_parent_type", "process_parent_id")` which is PostgreSQL-only. The patch replaces it with `Min('id')` + `GROUP BY`:
+
+```python
+def _mssql_list_requests():
+    min_ids = (
+        ActivationRequestQueue.objects
+        .values('process_parent_type', 'process_parent_id')
+        .annotate(min_id=Min('id'))
+        .values_list('min_id', flat=True)
+    )
+    return ActivationRequestQueue.objects.filter(
+        id__in=min_ids
+    ).order_by('process_parent_id')
+```
+
+This patch is deferred into `CoreConfig.ready()` because importing `aap_eda.tasks.activation_request_queue` at settings-load time triggers an import cascade (`tasks.__init__` → `project.py` → `core.models` → `ansible_base.rbac` → settings access) that fails with `AttributeError: 'Settings' object has no attribute 'ANSIBLE_BASE_ORGANIZATION_MODEL'`.
+
+### 4.4 Schema Migration
+
+Run Django migrations from a pod or a helper script with `post_migrate` signals disabled (EDA's `post_migrate` handlers try to query tables before they exist):
+
+```python
+# run_eda_migrations.py — run inside the pod or locally with PYTHONPATH set
+import os, sys
+sys.path.insert(0, '/opt/mssql-poc')
+os.environ['DJANGO_SETTINGS_MODULE'] = 'eda_mssql_settings'
+
+import django
+django.setup()
+
+from django.db.models.signals import post_migrate
+receivers_backup = list(post_migrate.receivers)
+post_migrate.receivers = []
+
+from django.core.management import call_command
+call_command('migrate', database='mssql', verbosity=2)
+
+post_migrate.receivers = receivers_backup
+```
+
+Run inside the EDA pod:
+```bash
+EDA_POD=$(kubectl -n aap27 get pods -l app.kubernetes.io/name=eda-api \
+  -o jsonpath='{.items[0].metadata.name}')
+
+kubectl cp run_eda_migrations.py aap27/$EDA_POD:/tmp/ -c eda-api
+
+kubectl exec -n aap27 $EDA_POD -c eda-api -- bash -c "
+  PYTHONPATH=/opt/mssql-poc DJANGO_SETTINGS_MODULE=eda_mssql_settings \
+  python3 /tmp/run_eda_migrations.py
+"
+```
+
+### 4.5 Post-Migration Fixes
+
+#### Drop isjson CHECK Constraints
+
+```sql
+-- Connect to 'eda' database and drop all isjson constraints
+DECLARE @sql NVARCHAR(MAX) = '';
+SELECT @sql += 'ALTER TABLE [' + OBJECT_NAME(parent_object_id)
+    + '] DROP CONSTRAINT [' + name + '];' + CHAR(13)
+FROM sys.check_constraints
+WHERE definition LIKE '%isjson%';
+EXEC sp_executesql @sql;
+```
+
+#### Fix IDENTITY Columns
+
+Run `scripts/fix_eda_identity_columns.py` against the EDA database. This follows the same pattern as the gateway fix — rebuilds tables to add IDENTITY on `id` columns.
+
+**Important:** Tables with UUID primary keys (`core_audit_action`, `core_audit_event`) use `uniqueidentifier` and cannot have IDENTITY. The script correctly skips these tables.
+
+```bash
+python scripts/fix_eda_identity_columns.py
+```
+
+### 4.6 Migrate Data from PostgreSQL
+
+```bash
+kubectl cp scripts/migrate_eda_data.py aap27/$EDA_POD:/tmp/ -c eda-api
+
+kubectl exec -n aap27 $EDA_POD -c eda-api -- bash -c "
+  PYTHONPATH=/opt/mssql-poc DJANGO_SETTINGS_MODULE=eda_mssql_settings \
+  python3 /tmp/migrate_eda_data.py
+"
+```
+
+The script migrates all EDA tables in dependency order:
+- Django framework tables (content types, permissions, sessions)
+- EDA users, organizations, teams
+- Credentials and decision environments
+- Projects and rulebooks
+- Activations and event streams
+- Jobs and instances
+- Rulebook processes
+- Audit tables (UUID primary keys — no IDENTITY_INSERT needed)
+- Settings and feature flags
+- DAB tables (RBAC, resource registry)
+
+### 4.7 Deploy the EDA MSSQL Image
+
+**IMPORTANT:** Only modify EDA deployments. Do NOT touch controller or gateway.
+
+```bash
+# Set image on all 4 EDA deployments
+for dep in myaap-eda-api myaap-eda-activation-worker myaap-eda-default-worker myaap-eda-event-stream; do
+  kubectl set image deployment/$dep -n aap27 --all \
+    localhost:5001/aap27/eda-controller-rhel9:2.7-mssql
+done
+
+# Set env vars on all EDA deployments
+for dep in myaap-eda-api myaap-eda-activation-worker myaap-eda-default-worker myaap-eda-event-stream; do
+  kubectl set env deployment/$dep -n aap27 --containers='*' \
+    DJANGO_SETTINGS_MODULE=eda_mssql_settings \
+    PYTHONPATH=/opt/mssql-poc
+done
+```
+
+Wait for rollout:
+```bash
+for dep in myaap-eda-api myaap-eda-activation-worker myaap-eda-default-worker myaap-eda-event-stream; do
+  kubectl rollout status deployment/$dep -n aap27 --timeout=120s
+done
+```
+
+#### Image Cache Busting
+
+Kubernetes nodes cache images by tag. If you rebuild with the same tag, pods may use the stale cached image. Use incrementing tags (e.g. `2.7-mssql-v2`, `2.7-mssql-v3`, ...) to force pulls:
+
+```bash
+podman build -f Dockerfile.eda -t localhost:5001/aap27/eda-controller-rhel9:2.7-mssql-v2 .
+podman push localhost:5001/aap27/eda-controller-rhel9:2.7-mssql-v2
+```
+
+#### Fix Nginx Container Environment
+
+EDA's `eda-api` and `eda-event-stream` deployments contain **nginx containers** whose entrypoints import Django settings (requiring `SECRET_KEY`). These containers need environment variables even though they run nginx:
+
+```bash
+# Add envFrom to nginx containers in eda-api deployment
+kubectl patch deployment myaap-eda-api -n aap27 --type json -p '[
+  {"op": "add", "path": "/spec/template/spec/containers/1/envFrom",
+   "value": [{"configMapRef": {"name": "myaap-eda-eda-env-properties"}}]},
+  {"op": "add", "path": "/spec/template/spec/containers/1/env/-",
+   "value": {"name": "EDA_SECRET_KEY", "valueFrom":
+     {"secretKeyRef": {"name": "myaap-eda-server", "key": "secret_key"}}}}
+]'
+
+# Same for eda-event-stream nginx container
+kubectl patch deployment myaap-eda-event-stream -n aap27 --type json -p '[
+  {"op": "add", "path": "/spec/template/spec/containers/1/envFrom",
+   "value": [{"configMapRef": {"name": "myaap-eda-eda-env-properties"}}]},
+  {"op": "add", "path": "/spec/template/spec/containers/1/env/-",
+   "value": {"name": "EDA_SECRET_KEY", "valueFrom":
+     {"secretKeyRef": {"name": "myaap-eda-server", "key": "secret_key"}}}}
+]'
+```
+
+#### Fix init-container Crash
+
+The `eda-initial-data` init container may fail with `Organization.DoesNotExist` (pre-existing PG issue). Make it tolerate failures:
+
+```bash
+kubectl patch deployment myaap-eda-api -n aap27 --type json -p '[
+  {"op": "replace",
+   "path": "/spec/template/spec/initContainers/0/args",
+   "value": ["-c", "aap-eda-manage create_initial_data || echo WARN: create_initial_data failed, continuing"]}
+]'
+```
+
+### 4.8 Verify EDA
+
+```bash
+# Check all 4 EDA deployments are running
+kubectl get pods -n aap27 | grep eda
+
+# Verify MSSQL routing
+kubectl exec -n aap27 $EDA_POD -c eda-api -- bash -c "
+  PYTHONPATH=/opt/mssql-poc DJANGO_SETTINGS_MODULE=eda_mssql_settings \
+  python3 -c \"
+import django; import os
+os.environ['DJANGO_SETTINGS_MODULE']='eda_mssql_settings'
+django.setup()
+from django.conf import settings
+print('MSSQL engine:', settings.DATABASES.get('mssql', {}).get('ENGINE'))
+print('Router:', settings.DATABASE_ROUTERS)
+from aap_eda.core.models import Organization
+print('Org count (from MSSQL):', Organization.objects.count())
+\"
+"
+
+# Verify controller and gateway images are UNCHANGED
+kubectl get deploy myaap-controller-task myaap-controller-web myaap-gateway -n aap27 \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.template.spec.containers[0].image}{"\n"}{end}'
+```
+
+Expected: EDA pods all Running; controller/gateway images remain at their `2.7-mssql` tags (not changed to EDA image).
+
+---
+
+## Part 5: Service Cluster Data Sync (Restoring Envoy Routing)
 
 ### Why This Step Exists — The Failure Sequence
 
@@ -570,7 +837,7 @@ kubectl set image deployment/myaap-controller-web \
 
 After gateway is on MSSQL, the Envoy xDS endpoints must return valid cluster and listener config. This requires the service cluster data (which services exist and how to route to them) to be present in MSSQL.
 
-### 4.1 Understanding Service Clusters
+### 5.1 Understanding Service Clusters
 
 The gateway maintains 4 service clusters that define how Envoy routes traffic:
 
@@ -591,7 +858,7 @@ Related tables (in FK dependency order):
 - `aap_gateway_api_serviceapiroute` — API route definitions
 - `aap_gateway_api_additionalroute` — additional routes
 
-### 4.2 Delete Order (FK constraints)
+### 5.2 Delete Order (FK constraints)
 
 If you need to re-sync data, delete in this order to avoid FK constraint violations:
 
@@ -605,7 +872,7 @@ DELETE FROM aap_gateway_api_httpport;
 DELETE FROM aap_gateway_api_servicecluster;
 ```
 
-### 4.3 UNIQUE Constraint on service_type Column
+### 5.3 UNIQUE Constraint on service_type Column
 
 **Gotcha:** MSSQL may have an extra `service_type` column (nvarchar) on `aap_gateway_api_servicecluster` that doesn't exist in PostgreSQL, alongside the correct `service_type_id` (bigint FK). This column has a UNIQUE constraint that only allows one NULL value — blocking insertion of multiple clusters.
 
@@ -629,7 +896,7 @@ ALTER TABLE aap_gateway_api_servicecluster
   DROP CONSTRAINT UQ__aap_gate__<suffix>;
 ```
 
-### 4.4 IDENTITY_INSERT for Service Cluster Data
+### 5.4 IDENTITY_INSERT for Service Cluster Data
 
 When inserting rows with explicit ID values (to match PostgreSQL IDs), you must enable `IDENTITY_INSERT`:
 
@@ -641,7 +908,7 @@ VALUES (1, 'Gateway', ..., 1);
 SET IDENTITY_INSERT aap_gateway_api_servicecluster OFF;
 ```
 
-### 4.5 Verify xDS Endpoints
+### 5.5 Verify xDS Endpoints
 
 After data sync, verify Envoy can get valid config:
 
@@ -660,7 +927,7 @@ kubectl exec -n aap27 $GATEWAY_POD -c api -- \
 
 Expected: JSON response with `resources` array containing cluster/listener definitions for all 4 services.
 
-### 4.6 Verify Controller Routing Through Gateway
+### 5.6 Verify Controller Routing Through Gateway
 
 ```bash
 # Controller API through Envoy
@@ -669,9 +936,9 @@ curl -s http://localhost:44927/api/controller/v2/ping/ | python3 -m json.tool
 
 ---
 
-## Part 5: End-to-End Verification
+## Part 6: End-to-End Verification
 
-### 5.1 Full Stack Health Check
+### 6.1 Full Stack Health Check
 
 ```bash
 # Gateway ping
@@ -684,15 +951,18 @@ curl -s http://localhost:44927/api/controller/v2/ping/ | python3 -m json.tool
 # (see Part 2.8 for job execution commands)
 ```
 
-### 5.2 Expected Results
+### 6.2 Expected Results
 
 - Gateway ping: `db_connected: true`
 - Controller ping: `200 OK`
+- EDA pods: all 4 deployments Running (api 3/3, activation-worker 1/1, default-worker 1/1, event-stream 2/2)
 - Job execution: `status=successful`, `failed=False`, 9 events
 - UI accessible at `http://localhost:44927`
 - Controller visible in gateway UI under Resources
+- Automation Decisions visible in gateway UI
+- MSSQL databases: `awx` (158 tables), `aap_gateway` (58 tables), `eda` (52 tables)
 
-### 5.3 Check Logs
+### 6.3 Check Logs
 
 ```bash
 # Controller logs
@@ -703,20 +973,28 @@ kubectl logs -n aap27 -l app.kubernetes.io/component=automationcontroller \
 # Gateway logs
 kubectl logs -n aap27 -l app.kubernetes.io/name=gateway \
   -c api --since=5m | grep -iE 'error|exception'
+
+# EDA logs
+kubectl logs -n aap27 -l app.kubernetes.io/name=eda-api \
+  -c eda-api --since=5m | grep -iE 'error|exception'
+
+kubectl logs -n aap27 -l app.kubernetes.io/name=eda-default-worker \
+  --since=5m | grep -iE 'error|exception'
 ```
 
 ---
 
 ## Shared Library: mssql_common.py
 
-The `lib/mssql_common.py` module centralises all reusable MSSQL patches so that controller and gateway don't duplicate code. It provides:
+The `lib/mssql_common.py` module centralises all reusable MSSQL patches so that controller, gateway, and EDA don't duplicate code. It provides:
 
 | Function | Purpose |
 |----------|---------|
 | `apply_orm_patches(DATABASES, db_name, ...)` | One-call setup: adds mssql database, installs router, advisory lock noop, transaction patches, UUID format fix, bulk_create fix |
 | `get_sb_broker_config(db_name)` | Build Service Broker config dict for dispatcherd |
 | `stub_pg_notify()` | Stub `dispatcherd.brokers.pg_notify` in `sys.modules` |
-| `install_uuid_format_patch()` | Sets `DatabaseFeatures.has_native_uuid_field = True` (MSSQL's `uniqueidentifier` type needs this) |
+| `install_uuid_format_patch()` | Override `UUIDField.db_type()` to return `'uniqueidentifier'` on MSSQL, and set `has_native_uuid_field = True` |
+| `install_textfield_index_patch()` | Cap TextField to `nvarchar(450)` on MSSQL so SQL Server can index them (required by EDA's `TextField(unique=True)`) |
 | `get_odbc_connection_string(db_name)` | Build pyodbc connection string for direct ODBC use |
 | `add_mssql_healthcheck(databases, db_name)` | Override `healthcheck` alias to point at MSSQL |
 
@@ -737,7 +1015,7 @@ Without `has_native_uuid_field = True`, Django's `UUIDField.get_db_prep_value()`
 
 ### service_broker.py
 
-The `service_broker.py` module implements the `dispatcherd` Broker Protocol. It's a standalone module with no AWX or gateway imports (only `pyodbc`, `dispatcherd.chunking`, `dispatcherd.protocols`). This means the same file works for both controller and gateway.
+The `service_broker.py` module implements the `dispatcherd` Broker Protocol. It's a standalone module with no AWX, gateway, or EDA imports (only `pyodbc`, `dispatcherd.chunking`, `dispatcherd.protocols`). This means the same file works for all three components.
 
 Key features:
 - Sync and async connection management
@@ -762,6 +1040,17 @@ Gateway is simpler — it only uses dispatcherd for cache invalidation broadcast
 | Dispatcherd (cache invalidation) | `dispatcherd.brokers.pg_notify` | `aap_gateway_api.dispatch.brokers.service_broker` |
 
 No PubSub, no wsrelay, no HostMetric — these are AWX-specific.
+
+### Two Codepaths Replaced (EDA)
+
+EDA uses dispatcherd for both task dispatch and activation worker coordination:
+
+| Codepath | Original | Replacement |
+|----------|----------|-------------|
+| Dispatcherd (DefaultWorker) | `dispatcherd.brokers.pg_notify` | `service_broker` (via PYTHONPATH) |
+| Dispatcherd (ActivationWorker) | `dispatcherd.brokers.pg_notify` | `service_broker` (dynamic channel per RULEBOOK_QUEUE_NAME) |
+
+No PubSub, no wsrelay, no HostMetric — these are AWX-specific. The dispatcherd management command is monkey-patched to use `service_broker` config instead of hardcoded `pg_notify`.
 
 ---
 
@@ -806,6 +1095,24 @@ AppConfig.ready() ────>  _mssql_gw_ready():
                          └── patch XDSView.get_qs
 ```
 
+### Load Order (EDA)
+
+```
+DJANGO_SETTINGS_MODULE ──>  eda_mssql_settings.py (settings wrapper)
+                            │
+                            ├── from aap_eda.settings.default import * (Dynaconf)
+                            ├── apply_orm_patches() (eager)
+                            ├── pg_notify stub with Broker class (eager)
+                            ├── DISPATCHERD_DEFAULT_SETTINGS override (eager)
+                            ├── patch CoreConfig.ready()
+                            └── patch dispatcherd management command
+                            │
+AppConfig.ready() ────────> _mssql_eda_ready():
+                            ├── dab_decorate import
+                            ├── dispatcher_setup(DISPATCHERD_DEFAULT_SETTINGS)
+                            └── patch list_requests() (DISTINCT ON → Min/GROUP BY)
+```
+
 ### Why `weak=False` on Signal Handlers
 
 All `connection_created.connect()` calls use `weak=False`. Conf.d files are loaded via `exec()` — without strong references, Python garbage-collects the handler functions when the exec scope exits, silently disconnecting the signal handlers.
@@ -827,11 +1134,14 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **IDENTITY columns missing** | `Cannot insert explicit value for identity column` or auto-increment doesn't work | Run `fix_gateway_identity_columns.py` — mssql-django doesn't create IDENTITY on `id` columns during `migrate` |
 | **DISTINCT ON (PostgreSQL-only)** | xDS endpoints return empty/error | Patch `XDSView.get_qs` with `Min('id')` + `GROUP BY` |
 | **isjson CHECK constraints** | JSON field operations blocked | Drop all isjson constraints: `fix_schema_gaps.sql` |
-| **UNIQUE constraint on NULL** | Can only insert one row with NULL in UNIQUE column | Drop the UNIQUE constraint (see Part 4.3) |
+| **UNIQUE constraint on NULL** | Can only insert one row with NULL in UNIQUE column | Drop the UNIQUE constraint (see Part 5.3) |
 | **IDENTITY_INSERT** | Must be ON when inserting explicit IDs, OFF after | Wrap inserts: `SET IDENTITY_INSERT [table] ON; ... OFF;` |
 | **pyodbc parameter passing** | `TypeError: takes from 2 to 3 positional arguments` | pyodbc 5.x: `cursor.execute(sql, [p1, p2])` not `cursor.execute(sql, p1, p2)` |
 | **Table partitioning** | Migration 0144 fails | Fake it — SQL Server doesn't support PG-style partitioning |
 | **UUID format** | `uniqueidentifier` rejects hex strings | `DatabaseFeatures.has_native_uuid_field = True` |
+| **UUIDField → char(32)** | `Insufficient result space to convert uniqueidentifier value to char` in OUTPUT INSERTED | Override `UUIDField.db_type()` to return `'uniqueidentifier'` instead of patching `data_types` dict (avoids circular import) |
+| **TextField(unique=True)** | `Cannot create index on nvarchar(max)` — EDA uses TextField with unique=True and explicit indexes | `install_textfield_index_patch()` caps TextField to `nvarchar(450)` on MSSQL |
+| **UUID PK tables + IDENTITY** | `Identity column 'id' must be of data type int, bigint...` | Tables with `uniqueidentifier` PKs (`core_audit_action`, `core_audit_event`) don't need IDENTITY — skip them |
 
 ### Django / Python Specific
 
@@ -842,18 +1152,23 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **pg_notify stub empty** | `AttributeError: module has no attribute 'Broker'` | Stub must include Broker class (dispatcherd resolves broker at config time) |
 | **Broker init params** | `RuntimeError: Must specify config` | Broker expects `config=dict`, not `**dict` spread |
 | **DATABASES['default']** | Django requires it | Keep pointing at PG or redirect to MSSQL too |
+| **Dynaconf settings load** | `AttributeError: 'Settings' object has no attribute 'ANSIBLE_BASE_ORGANIZATION_MODEL'` | Cannot import `aap_eda.tasks.*` at settings-load time — triggers import cascade through models → rbac → settings. Defer to `CoreConfig.ready()` |
+| **post_migrate signals** | Migration fails when post_migrate handlers query tables that don't exist yet | Disconnect `post_migrate.receivers` before `migrate`, restore after |
 
 ### Deployment Specific
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
-| **Gateway MSSQL breaks controller routing** | Controller disappears from UI, `/api/controller/` returns 503, xDS returns `RelatedObjectDoesNotExist` | Service cluster data must be synced to MSSQL before/after gateway switchover — xDS queries now hit MSSQL not PG (see Part 4) |
+| **Gateway MSSQL breaks controller routing** | Controller disappears from UI, `/api/controller/` returns 503, xDS returns `RelatedObjectDoesNotExist` | Service cluster data must be synced to MSSQL before/after gateway switchover — xDS queries now hit MSSQL not PG (see Part 5) |
 | **Controller image reverts to base** | `ModuleNotFoundError: No module named 'awx.main.dispatch.brokers'`, dispatcher crash-loops | Deployment spec wasn't updated — use `kubectl set image` to persist the `2.7-mssql` tag in the deployment, not just the running pod. Verify with `kubectl get deploy -o jsonpath='{.spec.template.spec.containers[*].image}'` |
 | **FK constraint ordering** | `DELETE conflicted with REFERENCE constraint` | Delete in order: serviceapiroute → additionalroute → route → servicekey → servicenode → httpport → servicecluster |
 | **Gateway login is form-encoded** | 403 or redirect to login page | POST to `/api/gateway/v1/login/` with `Content-Type: application/x-www-form-urlencoded` and CSRF token, not JSON |
 | **cache-clear psycopg error** | `psycopg.errors.UndefinedTable: relation "awx_notify_messages"` | Non-critical — `run_cache_clear` imports `pg_bus_conn` before deferred patch fires. Self-recovers on restart |
 | **servicenode has no port column** | `Invalid column name 'port'` | MSSQL servicenode table doesn't have a `port` column (only: id, name, address, tags, etc.) |
 | **dispatcherd_connected: false in gateway ping** | Gateway ping shows false | Non-critical for POC — dispatcherd status check may not fully initialize in all modes |
+| **EDA nginx containers crash** | `ImproperlyConfigured: Either "SECRET_KEY" or "SECRET_KEY_FILE"` | Nginx containers in eda-api and eda-event-stream need `envFrom` (configMapRef) and `EDA_SECRET_KEY` (secretKeyRef) even though they run nginx — entrypoint imports Django |
+| **eda-initial-data init container** | `Organization.DoesNotExist` | Pre-existing PG issue; make init container tolerate failures with `|| echo WARN` |
+| **Image tag caching (K8s)** | Rebuilt image with same tag not picked up | Use incrementing tags (v2, v3, ...) to force image pulls. `imagePullPolicy: Always` also works but is slower |
 
 ---
 
@@ -865,6 +1180,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 |------|-------------|
 | `Dockerfile.controller` | Full Dockerfile for controller MSSQL image (ODBC + pyodbc + mssql-django + shared lib + broker) |
 | `Dockerfile.gateway` | Full Dockerfile for gateway MSSQL image (same structure, gateway paths) |
+| `Dockerfile.eda` | Full Dockerfile for EDA MSSQL image (system Python, all files to /opt/mssql-poc/) |
 | `Dockerfile.fragment` | Container build fragment for controller (ODBC driver + Python packages only) |
 | `Dockerfile.gateway.fragment` | Container build fragment for gateway |
 
@@ -874,8 +1190,9 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 |------|-------------|
 | `mssql-confd.py` | Controller conf.d configuration: ORM routing + dispatch + PubSub + wsrelay patches |
 | `gateway-mssql-settings.py` | Gateway settings append: ORM routing + dispatch + xDS + PingView patches |
-| `lib/mssql_common.py` | Shared library: reusable ORM patches, broker config, pg_notify stub |
-| `service_broker.py` | Dispatcherd broker module: SQL Server notification bus (used by both components) |
+| `eda-mssql-settings.py` | EDA Dynaconf wrapper: ORM routing + dispatcherd + DISTINCT ON patch + management command override |
+| `lib/mssql_common.py` | Shared library: reusable ORM patches, broker config, pg_notify stub, TextField index fix |
+| `service_broker.py` | Dispatcherd broker module: SQL Server notification bus (used by all three components) |
 
 ### SQL Scripts
 
@@ -883,6 +1200,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 |------|-------------|
 | `scripts/setup_notification_bus.sql` | Controller: create `awx` notification bus objects |
 | `scripts/setup_gateway_db.sql` | Gateway: create `aap_gateway` database + notification bus objects |
+| `scripts/setup_eda_db.sql` | EDA: create `eda` database + notification bus objects |
 | `scripts/fix_schema_gaps.sql` | Controller: fix missing columns, tables, views, drop isjson constraints |
 | `scripts/fix_gateway_schema_gaps.sql` | Gateway: drop isjson constraints, reseed IDENTITY counters |
 
@@ -892,7 +1210,9 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 |------|-------------|
 | `scripts/migrate_pg_to_mssql.py` | Controller: PG → MSSQL data migration (run in controller pod) |
 | `scripts/migrate_gateway_data.py` | Gateway: PG → MSSQL data migration (run in gateway pod) |
+| `scripts/migrate_eda_data.py` | EDA: PG → MSSQL data migration (run in EDA pod) |
 | `scripts/fix_gateway_identity_columns.py` | Gateway: add IDENTITY property to all `id` columns (rebuild tables) |
+| `scripts/fix_eda_identity_columns.py` | EDA: add IDENTITY property to `id` columns (skips UUID PK tables) |
 
 ### Deployment
 
