@@ -1320,6 +1320,46 @@ Expected output for all three components: `ENGINE=microsoft`, `HOST=host.docker.
 | EDA init containers have `SKIP_MSSQL=1` | Init containers crash trying to connect to PG | Remove `SKIP_MSSQL`, set `DJANGO_SETTINGS_MODULE=eda_mssql_settings` |
 | Gateway `dispatcherd_connected: false` | Non-critical — dispatcherd health check uses different mechanism | Cosmetic only, gateway fully functional |
 | Automation Hub non-functional | Hub has not been migrated to MSSQL | Out of scope for this POC |
+| Controller `ansible_id` column type mismatch | "Automation Executions" missing from UI, all authenticated API calls return 500 | Fix column from `char(32)` to `uniqueidentifier` (see 7.8) |
+
+### 7.8 Fix Controller Resource Registry UUID Format
+
+After data migration, the controller's `dab_resource_registry_resource.ansible_id` column may be `char(32)` with unhyphenated hex strings, while gateway and EDA use `uniqueidentifier`. This causes 500 errors on all authenticated controller API calls through the gateway because DAB JWT auth passes hyphenated UUIDs that can't match against the `char(32)` values.
+
+**Symptom:** Controller API returns `Conversion failed when converting from a character string to uniqueidentifier (8169)` in `get_object_by_ansible_id`. The "Automation Executions" section is missing from the AAP UI.
+
+**Fix (run from any pod with pyodbc access to the awx database):**
+
+```python
+import pyodbc
+conn = pyodbc.connect(
+    'DRIVER={ODBC Driver 18 for SQL Server};'
+    'SERVER=host.docker.internal,1433;DATABASE=awx;'
+    'UID=SA;PWD=<password>;TrustServerCertificate=yes;')
+conn.autocommit = True
+c = conn.cursor()
+
+# 1. Drop the unique constraint (name may vary — check with sys.indexes query)
+c.execute("ALTER TABLE dab_resource_registry_resource DROP CONSTRAINT UQ__dab_reso__4985FC72617547C9")
+
+# 2. Widen column to fit hyphenated UUIDs
+c.execute("ALTER TABLE dab_resource_registry_resource ALTER COLUMN ansible_id varchar(36) NOT NULL")
+
+# 3. Insert hyphens (8-4-4-4-12 format)
+c.execute("""
+    UPDATE dab_resource_registry_resource
+    SET ansible_id = STUFF(STUFF(STUFF(STUFF(RTRIM(ansible_id), 9, 0, '-'), 14, 0, '-'), 19, 0, '-'), 24, 0, '-')
+    WHERE LEN(RTRIM(ansible_id)) = 32
+""")
+
+# 4. Convert to uniqueidentifier (matches gateway/EDA schema)
+c.execute("ALTER TABLE dab_resource_registry_resource ALTER COLUMN ansible_id uniqueidentifier NOT NULL")
+
+# 5. Recreate unique constraint
+c.execute("ALTER TABLE dab_resource_registry_resource ADD CONSTRAINT UQ_dab_rr_ansible_id UNIQUE (ansible_id)")
+```
+
+**Root cause:** The `mssql_common.install_uuid_format_patch()` override makes `UUIDField.db_type()` return `uniqueidentifier`, but this only affects Django's SQL generation going forward. If the initial schema migration ran before this patch was in place, `ansible_id` was created as `char(32)` — and the PG→MSSQL data migration copied the raw hex values without hyphens.
 
 ---
 
@@ -1518,6 +1558,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **EDA init containers have `SKIP_MSSQL=1`** | Init containers crash-loop when PG is down | Init containers were configured to skip MSSQL during initial migration. For PG-free operation, remove `SKIP_MSSQL` and set `DJANGO_SETTINGS_MODULE=eda_mssql_settings` (see Part 7.4) |
 | **Controller rsyslog uses non-MSSQL image** | rsyslog container crash-loops on `wait-for-migrations` | rsyslog container built from base controller image, which connects to PG. Use the MSSQL controller image for this container (see Part 7.2) |
 | **Controller rsyslog missing mssql.py mount** | rsyslog crash-loops even with MSSQL image; controller shows "no healthy upstream" in UI | rsyslog container doesn't have the `/etc/tower/conf.d/mssql.py` volume mount. Without it, `DATABASES['default']` redirect never loads. Pod shows NotReady, Envoy ejects the upstream. Add the volume mount via `kubectl patch` (see Part 7.2) |
+| **Controller `ansible_id` char(32) vs uniqueidentifier** | Controller API returns 500 on all authenticated requests through gateway; "Automation Executions" missing from UI | `dab_resource_registry_resource.ansible_id` migrated as `char(32)` with unhyphenated hex strings (e.g. `d60e11536a304de88511352a81cd333e`) but gateway and EDA use `uniqueidentifier`. DAB JWT auth passes hyphenated UUIDs → MSSQL can't match. Fix: drop unique constraint, ALTER to `varchar(36)`, UPDATE with STUFF to insert hyphens, ALTER to `uniqueidentifier`, recreate constraint (see Part 7.8) |
 
 ---
 
