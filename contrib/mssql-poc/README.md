@@ -113,7 +113,7 @@ These values were used in the proven deployment. Adjust as needed.
 | Controller base image | `localhost:5001/aap27/controller-rhel9:2.7` |
 | Gateway base image | `localhost:5001/aap27/gateway-rhel9:2.7` |
 | EDA base image | `localhost:5001/aap27/eda-controller-rhel9:2.7` |
-| MSSQL image tag | `2.7-mssql` (controller/gateway), `2.7-mssql-v11` (EDA) |
+| MSSQL image tag | `2.7-mssql` (controller/gateway/EDA) |
 | Kind cluster runtime | Podman |
 | External gateway port | `44927` |
 | Gateway session cookie | `gateway_sessionid44927` |
@@ -587,7 +587,8 @@ This modifies **zero** EDA source files.
 | `_PgNotifyStubBroker` | pg_notify stub with Broker class that delegates to Service Broker |
 | `DISPATCHERD_DEFAULT_SETTINGS` | Override dispatcherd config to use `service_broker` instead of `pg_notify` |
 | `DISPATCHERD_DEFAULT_WORKER_SETTINGS` | DefaultWorker-specific config with scheduled producers |
-| `_mssql_eda_ready()` | Replacement `CoreConfig.ready()` that configures dispatcherd and patches DISTINCT ON |
+| `_mssql_eda_ready()` | Replacement `CoreConfig.ready()` that configures dispatcherd, bypasses health check, and patches DISTINCT ON |
+| `check_dispatcherd_workers_health` bypass | Stubs health check to always return `True` — `control_with_reply("alive")` is incompatible with Service Broker. Patches both `aap_eda.core.health` and `aap_eda.core.views` modules (from-import binding) |
 | `_mssql_dispatcherd_handle()` | Replacement dispatcherd management command handler for ActivationWorker/DefaultWorker |
 | `_mssql_list_requests()` | Replaces `DISTINCT ON` (PG-only) in `activation_request_queue.list_requests()` |
 | `install_textfield_index_patch()` | Caps TextField to `nvarchar(450)` for MSSQL index compatibility |
@@ -765,7 +766,168 @@ kubectl patch deployment myaap-eda-api -n aap27 --type json -p '[
 ]'
 ```
 
-### 4.8 Verify EDA
+### 4.8 Fix EDA Health Check (Envoy Routing)
+
+After deploying EDA on MSSQL, the gateway may return **503 Service Unavailable** for all EDA requests (e.g. clicking "Projects" in Automation Decisions). This is caused by Envoy health checks failing on the EDA status endpoint.
+
+**Root Cause Chain:**
+
+1. Gateway's Envoy proxy health-checks EDA at `GET /api/eda/v1/status/` on port 8000
+2. EDA's `StatusView.get()` calls `check_dispatcherd_workers_health()`
+3. This function uses `control_with_reply("alive")` — a bidirectional control message through the broker
+4. Service Broker doesn't support `control_with_reply` — it returns an empty list
+5. EDA returns `{"status":"failed","message":"Dispatcherd workers unavailable"}` (HTTP 500)
+6. Envoy marks EDA as unhealthy → **all** EDA requests get 503
+
+**Fix (two parts):**
+
+**Part A — Bypass in `_mssql_eda_ready()`** (already in `eda-mssql-settings.py`):
+
+The `_mssql_eda_ready()` function patches `check_dispatcherd_workers_health` to always return `True`. The patch must happen **after** `dab_decorate` is imported (which triggers views loading), and must patch **both** modules due to Python's `from module import name` binding semantics:
+
+```python
+import aap_eda.core.health as _health
+import aap_eda.core.views as _views
+_bypass = lambda raise_exceptions=False: True
+_health.check_dispatcherd_workers_health = _bypass
+_views.check_dispatcherd_workers_health = _bypass
+```
+
+**Part B — Update nginx containers to use MSSQL image:**
+
+EDA's `eda-api` and `eda-event-stream` deployments each have a container named "nginx" that actually runs **gunicorn** on port 8000 (not actual nginx). This is the container Envoy health-checks. It needs the MSSQL image + environment variables:
+
+```bash
+# Update nginx container image in eda-api and eda-event-stream
+kubectl set image deployment/myaap-eda-api -n aap27 \
+  nginx=localhost:5001/aap27/eda-controller-rhel9:2.7-mssql
+
+kubectl set image deployment/myaap-eda-event-stream -n aap27 \
+  nginx=localhost:5001/aap27/eda-controller-rhel9:2.7-mssql
+
+# Set MSSQL env vars on the nginx containers
+for dep in myaap-eda-api myaap-eda-event-stream; do
+  kubectl set env deployment/$dep -n aap27 -c nginx \
+    DJANGO_SETTINGS_MODULE=eda_mssql_settings \
+    PYTHONPATH=/opt/mssql-poc
+done
+```
+
+**Verify:** Both ports should now return healthy status:
+```bash
+# Port 8000 (nginx/gunicorn — what Envoy checks)
+kubectl exec -n aap27 $EDA_POD -c nginx -- curl -s http://localhost:8000/api/eda/v1/status/
+# → {"status":"good"}
+
+# Port 8002 (eda-api gunicorn)
+kubectl exec -n aap27 $EDA_POD -c eda-api -- curl -s http://localhost:8002/api/eda/v1/status/
+# → {"status":"good"}
+```
+
+### 4.9 Post-Migration Data Integrity Fixes
+
+After data migration, several RBAC/resource registry tables may have missing or mismatched rows. These issues stem from two root causes:
+
+1. **Disabled `post_migrate` signals** — we disabled these during schema migration (Step 4.4) to prevent premature table access. Some DAB RBAC data is populated by `post_migrate` handlers, not by the migration files themselves.
+2. **Content type ID mismatch** — `django_content_type` IDs are auto-generated and differ between PG and MSSQL. Tables that reference content types by ID (e.g. `dab_resource_registry_resource`) retain PG's IDs after data copy, which don't match MSSQL's IDs.
+
+#### 4.9.1 Fix Missing DAB Content Types and Permissions
+
+The `dab_rbac_dabcontenttype` table may be missing entries that were created by `post_migrate` signals. In practice, `core.auditrule` is the most common missing entry.
+
+**Diagnose:**
+```bash
+kubectl exec -n aap27 $EDA_POD -c eda-api -- python3 -c "
+import os, django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'eda_mssql_settings')
+django.setup()
+from ansible_base.rbac.models import DABContentType, DABPermission
+pg_ct = set(DABContentType.objects.using('default').values_list('app_label','model',flat=False))
+ms_ct = set(DABContentType.objects.using('mssql').values_list('app_label','model',flat=False))
+missing = pg_ct - ms_ct
+print(f'Missing DAB content types: {missing or \"none\"}')
+print(f'DAB permissions: PG={DABPermission.objects.using(\"default\").count()}, MSSQL={DABPermission.objects.using(\"mssql\").count()}')
+"
+```
+
+**Fix:** Copy missing rows from PG to MSSQL with `IDENTITY_INSERT ON`. Must include all non-nullable columns (`id`, `service`, `app_label`, `model`, `api_slug`, `pk_field_type` for content types; `id`, `name`, `codename`, `content_type_id`, `api_slug` for permissions). Also copy any missing rows in the `dab_rbac_roledefinition_permissions` join table that reference the missing permission.
+
+#### 4.9.2 Fix Content Type ID Mismatch in Resource Registry
+
+**This affects Gateway specifically.** The `dab_resource_registry_resource` table has a `content_type_id` foreign key. When data is copied from PG, these IDs reference PG's `django_content_type` rows. But MSSQL's `django_content_type` table has different auto-generated IDs for the same `(app_label, model)` pairs.
+
+**Symptom:** `Resource.DoesNotExist` errors when creating users, assigning roles, or logging in. The error appears in Gateway logs as:
+```
+ansible_base.resource_registry.models.resource.Resource.DoesNotExist: Resource matching query does not exist.
+```
+
+**Diagnose:**
+```bash
+kubectl exec -n aap27 $GATEWAY_POD -c api -- python3 -c "
+import os, sys, django
+sys.path.insert(0, '/opt/mssql-poc')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'gateway_mssql_settings')
+django.setup()
+from django.contrib.contenttypes.models import ContentType
+from ansible_base.resource_registry.models import Resource
+pg_map = {ct.id: (ct.app_label, ct.model) for ct in ContentType.objects.using('default').all()}
+mssql_map = {(ct.app_label, ct.model): ct.id for ct in ContentType.objects.using('mssql').all()}
+bad = 0
+for r in Resource.objects.using('mssql').all():
+    key = pg_map.get(r.content_type_id)
+    if key:
+        correct = mssql_map.get(key)
+        if correct and correct != r.content_type_id:
+            bad += 1
+            print(f'Resource id={r.id}: ct_id {r.content_type_id} -> should be {correct} ({key[0]}.{key[1]})')
+print(f'Total needing fix: {bad}')
+"
+```
+
+**Fix:** Update each mismatched Resource row's `content_type_id` to the correct MSSQL value:
+```python
+r.content_type_id = correct_mssql_id
+r.save(using='mssql', update_fields=['content_type_id'])
+```
+
+#### 4.9.3 Remove Duplicate Resource Entries
+
+After fixing content type IDs, check for duplicate Resource entries. Duplicates occur when:
+1. The original PG row was copied with the wrong `content_type_id` (so the system couldn't find it)
+2. The application auto-created a new Resource row (with the correct `content_type_id`)
+3. We then fixed the original row's `content_type_id` — now both rows have the correct ID
+
+**Symptom:** `Resource.MultipleObjectsReturned: get() returned more than one Resource` on login or role assignment.
+
+**Diagnose:**
+```bash
+kubectl exec -n aap27 $GATEWAY_POD -c api -- python3 -c "
+import os, sys, django
+sys.path.insert(0, '/opt/mssql-poc')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'gateway_mssql_settings')
+django.setup()
+from ansible_base.resource_registry.models import Resource
+from django.db.models import Count
+dupes = (Resource.objects.using('mssql')
+    .values('content_type_id', 'object_id')
+    .annotate(cnt=Count('id')).filter(cnt__gt=1))
+for d in dupes:
+    print(f'Duplicate: ct_id={d[\"content_type_id\"]}, object_id={d[\"object_id\"]}, count={d[\"cnt\"]}')
+    for r in Resource.objects.using('mssql').filter(
+        content_type_id=d['content_type_id'], object_id=d['object_id']).order_by('id'):
+        print(f'  id={r.id}, ansible_id={r.ansible_id}')
+"
+```
+
+**Fix:** Keep the row whose `ansible_id` matches PG (preserves cross-service identity), delete the auto-created duplicate:
+```python
+# Compare with PG to find the canonical ansible_id
+pg_resource = Resource.objects.using('default').get(content_type=..., object_id=...)
+# Delete the MSSQL row that doesn't match
+Resource.objects.using('mssql').filter(...).exclude(ansible_id=pg_resource.ansible_id).delete()
+```
+
+### 4.10 Verify EDA
 
 ```bash
 # Check all 4 EDA deployments are running
@@ -1167,8 +1329,14 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **servicenode has no port column** | `Invalid column name 'port'` | MSSQL servicenode table doesn't have a `port` column (only: id, name, address, tags, etc.) |
 | **dispatcherd_connected: false in gateway ping** | Gateway ping shows false | Non-critical for POC — dispatcherd status check may not fully initialize in all modes |
 | **EDA nginx containers crash** | `ImproperlyConfigured: Either "SECRET_KEY" or "SECRET_KEY_FILE"` | Nginx containers in eda-api and eda-event-stream need `envFrom` (configMapRef) and `EDA_SECRET_KEY` (secretKeyRef) even though they run nginx — entrypoint imports Django |
+| **EDA 503 through gateway** | Clicking anything in Automation Decisions returns "Service Unavailable" | Envoy health-checks `/api/eda/v1/status/` on port 8000. `check_dispatcherd_workers_health()` fails because `control_with_reply("alive")` doesn't work through Service Broker. Fix: (1) bypass health check in `_mssql_eda_ready()`, (2) update nginx containers to MSSQL image + env vars (see Part 4.8) |
+| **EDA nginx is actually gunicorn** | Port 8000 still returns unhealthy after patching eda-api | The container named "nginx" in eda-api and eda-event-stream runs **gunicorn** on port 8000, not actual nginx. Must use MSSQL image + `DJANGO_SETTINGS_MODULE` env var on this container too |
+| **Python from-import binding** | `_health.check_dispatcherd_workers_health = bypass` doesn't fix the view | `from aap_eda.core.health import check_dispatcherd_workers_health` in views.py creates a local binding. Must patch **both** `aap_eda.core.health` AND `aap_eda.core.views` modules |
 | **eda-initial-data init container** | `Organization.DoesNotExist` | Pre-existing PG issue; make init container tolerate failures with `|| echo WARN` |
 | **Image tag caching (K8s)** | Rebuilt image with same tag not picked up | Use incrementing tags (v2, v3, ...) to force image pulls. `imagePullPolicy: Always` also works but is slower |
+| **Missing DAB content types** | `RuntimeError: Could not find content type for ('eda', 'core', 'auditrule')` on project create | `post_migrate` signals were disabled during migration — DAB RBAC content types and permissions created by those signals are missing. Copy from PG with `IDENTITY_INSERT ON` (see Part 4.9.1) |
+| **Content type ID mismatch** | `Resource.DoesNotExist` on user create or role assignment in Gateway | `django_content_type` IDs differ between PG and MSSQL. `dab_resource_registry_resource.content_type_id` retains PG values after data copy. Remap to MSSQL IDs (see Part 4.9.2) |
+| **Duplicate Resource entries** | `Resource.MultipleObjectsReturned: get() returned more than one Resource` on login | After fixing content type IDs, duplicate Resource rows exist (original + auto-created). Delete the auto-created duplicate, keep the one matching PG's `ansible_id` (see Part 4.9.3) |
 
 ---
 
@@ -1235,3 +1403,5 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 - **rotate_secret_key.py**: Uses `%s::jsonb` PostgreSQL-specific cast. Not critical (management command, not runtime).
 - **cursor_store.py**: Uses `ON CONFLICT ... DO UPDATE` PostgreSQL upsert. Not critical (only runs during `migrate_service_data` command).
 - **periodic_resource_sync**: Fails with 401 to Gateway. Pre-existing issue, unrelated to SQL Server.
+- **EDA dispatcherd health check bypassed**: `check_dispatcherd_workers_health()` is stubbed to always return `True` because `control_with_reply("alive")` doesn't work through Service Broker. Workers ARE running; only the health probe mechanism is incompatible. A production implementation would need a Service Broker-compatible health check.
+- **Post-migration data integrity**: Disabling `post_migrate` signals during schema migration means some RBAC data (DAB content types, permissions, join table entries) must be manually copied from PG. Content type IDs must also be remapped in the Resource registry. These are one-time fixes documented in Part 4.9.
