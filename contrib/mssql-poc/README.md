@@ -1183,6 +1183,24 @@ kubectl set image deployment/myaap-controller-task -n aap27 \
 kubectl set image deployment/myaap-controller-task -n aap27 \
   init-database=localhost:5001/aap27/controller-rhel9:2.7-mssql
 
+# CRITICAL: Add mssql.py volume mount to rsyslog containers
+# The rsyslog sidecar runs wait-for-migrations which uses DATABASES['default'].
+# Without the mssql.py conf.d mount, it can't load the DATABASES['default'] redirect
+# and will crash-loop trying to connect to PG — making the pod NotReady and
+# causing Envoy to mark the controller upstream as "no healthy upstream".
+kubectl patch deployment myaap-controller-web -n aap27 --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/2/volumeMounts/-","value":{
+    "mountPath":"/etc/tower/conf.d/mssql.py",
+    "name":"myaap-controller-application-credentials",
+    "readOnly":true,"subPath":"mssql.py"}}
+]'
+kubectl patch deployment myaap-controller-task -n aap27 --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/3/volumeMounts/-","value":{
+    "mountPath":"/etc/tower/conf.d/mssql.py",
+    "name":"myaap-controller-application-credentials",
+    "readOnly":true,"subPath":"mssql.py"}}
+]'
+
 kubectl rollout restart deployment/myaap-controller-web deployment/myaap-controller-task -n aap27
 ```
 
@@ -1499,6 +1517,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **Gateway `load_custom_envvars()` overrides `DATABASES['default']`** | Gateway `default` alias points to dead PG despite redirect in settings file | `aap_gateway_api.settings_utils._CUSTOM_ENVVAR_MAPPINGS` maps `DATABASE_HOST` → `DATABASES__default__HOST` etc. These env vars run AFTER the settings file. Must also set `DATABASE_HOST=host.docker.internal DATABASE_PORT=1433` etc. on the gateway deployment (see Part 7.3) |
 | **EDA init containers have `SKIP_MSSQL=1`** | Init containers crash-loop when PG is down | Init containers were configured to skip MSSQL during initial migration. For PG-free operation, remove `SKIP_MSSQL` and set `DJANGO_SETTINGS_MODULE=eda_mssql_settings` (see Part 7.4) |
 | **Controller rsyslog uses non-MSSQL image** | rsyslog container crash-loops on `wait-for-migrations` | rsyslog container built from base controller image, which connects to PG. Use the MSSQL controller image for this container (see Part 7.2) |
+| **Controller rsyslog missing mssql.py mount** | rsyslog crash-loops even with MSSQL image; controller shows "no healthy upstream" in UI | rsyslog container doesn't have the `/etc/tower/conf.d/mssql.py` volume mount. Without it, `DATABASES['default']` redirect never loads. Pod shows NotReady, Envoy ejects the upstream. Add the volume mount via `kubectl patch` (see Part 7.2) |
 
 ---
 
