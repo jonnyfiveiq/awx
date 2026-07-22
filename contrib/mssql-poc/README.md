@@ -1559,6 +1559,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **Controller rsyslog uses non-MSSQL image** | rsyslog container crash-loops on `wait-for-migrations` | rsyslog container built from base controller image, which connects to PG. Use the MSSQL controller image for this container (see Part 7.2) |
 | **Controller rsyslog missing mssql.py mount** | rsyslog crash-loops even with MSSQL image; controller shows "no healthy upstream" in UI | rsyslog container doesn't have the `/etc/tower/conf.d/mssql.py` volume mount. Without it, `DATABASES['default']` redirect never loads. Pod shows NotReady, Envoy ejects the upstream. Add the volume mount via `kubectl patch` (see Part 7.2) |
 | **Controller `ansible_id` char(32) vs uniqueidentifier** | Controller API returns 500 on all authenticated requests through gateway; "Automation Executions" missing from UI | `dab_resource_registry_resource.ansible_id` migrated as `char(32)` with unhyphenated hex strings (e.g. `d60e11536a304de88511352a81cd333e`) but gateway and EDA use `uniqueidentifier`. DAB JWT auth passes hyphenated UUIDs → MSSQL can't match. Fix: drop unique constraint, ALTER to `varchar(36)`, UPDATE with STUFF to insert hyphens, ALTER to `uniqueidentifier`, recreate constraint (see Part 7.8) |
+| **Job stdout uses PostgreSQL `LENGTH()` and `COPY TO STDOUT`** | Viewing job output in UI returns 500 Internal Server Error | `unified_jobs.py:result_stdout_raw_handle()` uses `LENGTH()` (MSSQL: `LEN`), psycopg3 `cursor.copy(COPY ... TO STDOUT)`, and `sql.SQL`/`sql.Identifier` composable objects. Monkey-patch replaces with `LEN()` aggregate and standard `SELECT ... ORDER BY start_line` query (see `mssql-confd.py`) |
 
 ---
 
@@ -1578,7 +1579,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 
 | File | Description |
 |------|-------------|
-| `mssql-confd.py` | Controller conf.d configuration: ORM routing + dispatch + PubSub + wsrelay patches |
+| `mssql-confd.py` | Controller conf.d configuration: ORM routing + dispatch + PubSub + wsrelay + HostMetric upsert + job stdout patches |
 | `gateway-mssql-settings.py` | Gateway settings append: ORM routing + dispatch + xDS + PingView patches |
 | `eda-mssql-settings.py` | EDA Dynaconf wrapper: ORM routing + dispatcherd + DISTINCT ON patch + management command override |
 | `lib/mssql_common.py` | Shared library: reusable ORM patches, broker config, pg_notify stub, TextField index fix |
