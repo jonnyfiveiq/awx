@@ -74,6 +74,67 @@ def _apply_host_metrics_patch(sender, connection, **kwargs):
 connection_created.connect(_apply_host_metrics_patch, weak=False)
 
 
+# --- Controller-specific: stdout view patch ---
+# result_stdout_raw_handle() uses PostgreSQL-only constructs:
+#   1. LENGTH() function (MSSQL uses LEN/DATALENGTH)
+#   2. cursor.copy(COPY ... TO STDOUT) — PostgreSQL COPY protocol
+#   3. psycopg3 sql.SQL/sql.Identifier/sql.Literal composable objects
+# Replace with MSSQL-compatible implementation.
+
+_stdout_patch_state = {'applied': False}
+
+def _apply_stdout_patch(sender, connection, **kwargs):
+    if _stdout_patch_state['applied']:
+        return
+    if connection.alias == 'mssql':
+        _stdout_patch_state['applied'] = True
+        try:
+            from awx.main.models.unified_jobs import UnifiedJob
+            from io import StringIO
+            import codecs
+            import subprocess
+            import re
+            from django.db import models, connections
+            from django.conf import settings as _s
+
+            def _mssql_result_stdout_raw_handle(self, enforce_max_bytes=True):
+                max_supported = getattr(_s, 'STDOUT_MAX_BYTES_DISPLAY', 1048576)
+                fd = StringIO()
+
+                with connections['mssql'].cursor() as cursor:
+                    if enforce_max_bytes:
+                        total = self.get_event_queryset().aggregate(
+                            total=models.Sum(models.Func(models.F('stdout'), function='LEN'))
+                        )['total'] or 0
+                        if total > max_supported:
+                            from awx.main.utils.common import StdoutMaxBytesExceeded
+                            raise StdoutMaxBytesExceeded(total, max_supported)
+
+                    tbl = self._meta.db_table + 'event'
+                    params = [self.id]
+
+                    if self.has_unpartitioned_events:
+                        tbl = '_unpartitioned_' + tbl
+                        where = f"[{self.event_parent_key}] = %s"
+                    else:
+                        where = f"job_created = %s AND [{self.event_parent_key}] = %s"
+                        params = [str(self.created), self.id]
+
+                    query = f"SELECT stdout FROM [{tbl}] WHERE {where} AND stdout != '' ORDER BY start_line"
+                    cursor.execute(query, params)
+                    for row in cursor.fetchall():
+                        fd.write(row[0])
+
+                fd.seek(0)
+                return fd
+
+            UnifiedJob.result_stdout_raw_handle = _mssql_result_stdout_raw_handle
+        except Exception as e:
+            _mssql_logger.warning(f'stdout patch failed: {e}')
+
+connection_created.connect(_apply_stdout_patch, weak=False)
+
+
 # =============================================================================
 # Phase 4: Replace pg_notify with SQL Server notification bus
 # Eliminates the last PostgreSQL dependency (dispatcherd, PubSub, wsrelay)
