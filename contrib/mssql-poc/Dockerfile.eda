@@ -1,0 +1,18 @@
+FROM localhost:5001/aap27/eda-controller-rhel9:2.7
+
+USER 0
+
+RUN curl -s https://packages.microsoft.com/config/rhel/9.0/prod.repo > /etc/yum.repos.d/mssql-release.repo && \
+    microdnf install -y unixODBC unixODBC-devel && \
+    ACCEPT_EULA=Y microdnf install -y msodbcsql18 && \
+    microdnf clean all
+
+RUN /usr/bin/pip3 install --no-deps mssql-django==1.7.3 pyodbc==5.3.0 pytz
+
+# Shared MSSQL library + settings + broker — all on PYTHONPATH at /opt/mssql-poc
+RUN mkdir -p /opt/mssql-poc
+COPY lib/mssql_common.py /opt/mssql-poc/mssql_common.py
+COPY service_broker.py /opt/mssql-poc/service_broker.py
+COPY eda-mssql-settings.py /opt/mssql-poc/eda_mssql_settings.py
+
+USER 1000

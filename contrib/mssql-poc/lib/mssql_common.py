@@ -106,7 +106,7 @@ def install_mssql_router():
 
         def allow_migrate(self, db, app_label, model_name=None, **hints):
             if db == 'mssql':
-                return False
+                return True
             return None
 
     return [MSSQLRouter()]
@@ -152,38 +152,79 @@ def install_transaction_patches():
 
 
 def install_uuid_format_patch():
-    """Tell Django that MSSQL has native UUID support (uniqueidentifier).
+    """Use native uniqueidentifier type for UUIDField on SQL Server.
 
-    Without this, UUIDField.get_db_prep_value() converts UUIDs to 32-char hex
-    strings (e.g. 'f02b136c4db24255bd7c57dadf127ea7') which SQL Server's
-    uniqueidentifier type rejects. With has_native_uuid_field=True, Django
-    passes the UUID object directly and pyodbc handles the conversion.
+    mssql-django defaults to char(32) for UUIDField, but this causes
+    "Insufficient result space to convert uniqueidentifier value to char"
+    in INSERT...OUTPUT INSERTED statements because the OUTPUT clause
+    tries to fit a 36-char uniqueidentifier into a 32-char column.
+
+    Fix: override UUIDField.db_type() to return 'uniqueidentifier' and
+    set has_native_uuid_field=True so Django passes UUID objects directly.
+    We cannot import mssql.base.DatabaseWrapper here (circular import
+    during settings loading), so we patch the field method instead.
     """
     from mssql.features import DatabaseFeatures
     DatabaseFeatures.has_native_uuid_field = True
 
+    from django.db import models
+    _orig_uuid_db_type = models.UUIDField.db_type
+
+    def _mssql_uuid_db_type(self, connection):
+        if connection.vendor == 'microsoft':
+            return 'uniqueidentifier'
+        return _orig_uuid_db_type(self, connection)
+
+    models.UUIDField.db_type = _mssql_uuid_db_type
+
 
 def install_bulk_create_patch():
-    """Patch bulk_create(ignore_conflicts=True) for SQL Server.
+    """Patch bulk_create for SQL Server.
 
-    Django maps ignore_conflicts to ON CONFLICT DO NOTHING (PG-only).
-    This fallback inserts rows one-by-one, swallowing duplicates.
+    Two issues on MSSQL:
+    1. ignore_conflicts maps to ON CONFLICT DO NOTHING (PG-only)
+    2. OUTPUT INSERTED.* with uniqueidentifier columns causes
+       "Insufficient result space to convert uniqueidentifier to char"
+
+    Fallback: insert rows one-by-one via save() on MSSQL.
     """
     from django.db.models.query import QuerySet as _QS
     _orig_bulk_create = _QS.bulk_create
 
     def _mssql_bulk_create(self, objs, *args, ignore_conflicts=False, **kwargs):
-        if ignore_conflicts and self.db == 'mssql':
+        if self.db == 'mssql':
             created = []
             for obj in objs:
                 try:
-                    created.extend(_orig_bulk_create(self, [obj], *args, **kwargs))
+                    obj.save(using='mssql')
+                    created.append(obj)
                 except Exception:
-                    pass
+                    if not ignore_conflicts:
+                        raise
             return created
         return _orig_bulk_create(self, objs, *args, ignore_conflicts=ignore_conflicts, **kwargs)
 
     _QS.bulk_create = _mssql_bulk_create
+
+
+def install_textfield_index_patch():
+    """Cap TextField to nvarchar(450) on MSSQL.
+
+    SQL Server cannot index nvarchar(max) columns. EDA uses
+    TextField(unique=True) and explicit Index() on TextField columns
+    extensively. For the POC, all TextFields use nvarchar(450) on MSSQL
+    to avoid index creation failures. 450 nvarchar chars = 900 bytes,
+    the SQL Server index key limit.
+    """
+    from django.db import models
+    _orig_db_type = models.TextField.db_type
+
+    def _mssql_text_db_type(self, connection):
+        if connection.vendor == 'microsoft':
+            return 'nvarchar(450)'
+        return _orig_db_type(self, connection)
+
+    models.TextField.db_type = _mssql_text_db_type
 
 
 def apply_orm_patches(databases, db_name, host=None, port=None, user=None, password=None,
@@ -207,6 +248,7 @@ def apply_orm_patches(databases, db_name, host=None, port=None, user=None, passw
     install_transaction_patches()
     install_uuid_format_patch()
     install_bulk_create_patch()
+    install_textfield_index_patch()
     return install_mssql_router()
 
 
