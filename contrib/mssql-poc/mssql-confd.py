@@ -15,6 +15,10 @@ from mssql_common import apply_orm_patches, get_sb_broker_config, stub_pg_notify
 
 DATABASE_ROUTERS = apply_orm_patches(DATABASES, db_name='awx')
 
+# Redirect 'default' to MSSQL so Django internals (health checks, connection.cursor(),
+# direct DATABASES['default'] access) don't require PostgreSQL.
+DATABASES['default'] = DATABASES['mssql'].copy()
+
 # --- Controller-specific: HostMetric upsert patch ---
 # AWX uses ON CONFLICT DO UPDATE for host metrics, which is PG-only.
 # This replaces it with IF NOT EXISTS / UPDATE for SQL Server.

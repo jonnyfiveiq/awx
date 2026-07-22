@@ -27,6 +27,10 @@ if not _SKIP_MSSQL:
         include_healthcheck=True,
     )
 
+    # Redirect 'default' to MSSQL so Django internals (health checks, connection.cursor(),
+    # direct DATABASES['default'] access) don't require PostgreSQL.
+    DATABASES['default'] = DATABASES['mssql'].copy()
+
 
 # =============================================================================
 # Phase 4: Replace pg_notify with SQL Server notification bus

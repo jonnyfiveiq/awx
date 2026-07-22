@@ -15,6 +15,7 @@ This guide covers running the full AAP platform (Controller + Gateway + EDA) wit
 - [Part 4: EDA on MSSQL](#part-4-eda-on-mssql)
 - [Part 5: Service Cluster Data Sync](#part-5-service-cluster-data-sync)
 - [Part 6: End-to-End Verification](#part-6-end-to-end-verification)
+- [Part 7: PostgreSQL-Free Operation](#part-7-postgresql-free-operation)
 - [Shared Library: mssql_common.py](#shared-library-mssql_commonpy)
 - [Notification Bus Architecture](#notification-bus-architecture)
 - [Monkey-Patch Rationale](#monkey-patch-rationale)
@@ -1146,6 +1147,164 @@ kubectl logs -n aap27 -l app.kubernetes.io/name=eda-default-worker \
 
 ---
 
+## Part 7: PostgreSQL-Free Operation
+
+This section covers the final POC milestone: proving that Controller, Gateway, and EDA function **without any PostgreSQL instance running**.
+
+### 7.1 The `DATABASES['default']` Problem
+
+Django and many internal code paths (health checks, `connection.cursor()`, middleware) access `DATABASES['default']` directly, bypassing the `MSSQLRouter`. When PostgreSQL is shut down, these code paths fail with `OperationalError: Connection refused`.
+
+The fix: redirect `DATABASES['default']` to the MSSQL alias in each component's settings.
+
+### 7.2 Controller Settings Update
+
+In `mssql-confd.py`, add after the `DATABASE_ROUTERS = apply_orm_patches(...)` line:
+
+```python
+DATABASES['default'] = DATABASES['mssql'].copy()
+```
+
+Also update the `myaap-controller-app-credentials` Secret with the new file and update the rsyslog container image to the MSSQL image (it runs `wait-for-migrations` at startup which connects to `default`):
+
+```bash
+# Encode and patch the Secret
+MSSQL_B64=$(base64 < contrib/mssql-poc/mssql-confd.py)
+kubectl patch secret myaap-controller-app-credentials -n aap27 \
+  --type merge -p "{\"data\":{\"mssql.py\":\"${MSSQL_B64}\"}}"
+
+# Update rsyslog container image on both controller deployments
+kubectl set image deployment/myaap-controller-web -n aap27 \
+  myaap-controller-rsyslog=localhost:5001/aap27/controller-rhel9:2.7-mssql
+kubectl set image deployment/myaap-controller-task -n aap27 \
+  myaap-controller-rsyslog=localhost:5001/aap27/controller-rhel9:2.7-mssql
+
+# Update init-database container image on controller-task
+kubectl set image deployment/myaap-controller-task -n aap27 \
+  init-database=localhost:5001/aap27/controller-rhel9:2.7-mssql
+
+kubectl rollout restart deployment/myaap-controller-web deployment/myaap-controller-task -n aap27
+```
+
+### 7.3 Gateway Settings Update
+
+In `gateway-mssql-settings.py`, add after `DATABASE_ROUTERS = apply_orm_patches(...)`:
+
+```python
+DATABASES['default'] = DATABASES['mssql'].copy()
+```
+
+**Critical Gateway caveat**: The gateway settings module (`aap_gateway_api.settings`) uses `load_custom_envvars()` which maps `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD` environment variables directly to `DATABASES['default']`. These env vars override the `DATABASES['default']` redirect from the settings file. You must also set these env vars to point at MSSQL:
+
+```bash
+# Override DATABASE_* env vars on the gateway deployment
+kubectl set env deployment/myaap-gateway -n aap27 --containers=api \
+  DATABASE_HOST=host.docker.internal \
+  DATABASE_PORT=1433 \
+  DATABASE_NAME=aap_gateway \
+  DATABASE_USER=SA \
+  DATABASE_PASSWORD='AAP_P0C_Password_2026!' \
+  DATABASE_ENGINE=mssql
+
+# Update the settings Secret
+GW_SETTINGS=$(cat gateway-base-settings.py gateway-mssql-settings.py)
+GW_B64=$(echo "$GW_SETTINGS" | base64)
+kubectl patch secret myaap-gateway-settings -n aap27 \
+  --type merge -p "{\"data\":{\"settings.py\":\"${GW_B64}\"}}"
+
+# Skip migrations in init container (PG is down, migrations already applied)
+kubectl patch deployment myaap-gateway -n aap27 --type='json' -p='[
+  {"op":"replace","path":"/spec/template/spec/initContainers/0/command",
+   "value":["echo","Migrations skipped - PG-free MSSQL mode"]}
+]'
+```
+
+### 7.4 EDA Settings Update
+
+In `eda-mssql-settings.py`, add after `DATABASE_ROUTERS = apply_orm_patches(...)`:
+
+```python
+DATABASES['default'] = DATABASES['mssql'].copy()
+```
+
+Then rebuild and push the EDA image (settings are baked in):
+
+```bash
+podman build -f Dockerfile.eda -t localhost:5001/aap27/eda-controller-rhel9:2.7-mssql-v17 .
+podman push --tls-verify=false localhost:5001/aap27/eda-controller-rhel9:2.7-mssql-v17
+
+# Update all EDA deployments and their init containers
+IMG=localhost:5001/aap27/eda-controller-rhel9:2.7-mssql-v17
+for dep in myaap-eda-api myaap-eda-activation-worker myaap-eda-default-worker myaap-eda-event-stream; do
+  kubectl set image deployment/$dep -n aap27 --all=$IMG  # containers
+done
+
+# Remove SKIP_MSSQL from init containers and set DJANGO_SETTINGS_MODULE
+for dep in myaap-eda-api myaap-eda-activation-worker myaap-eda-default-worker myaap-eda-event-stream; do
+  kubectl patch deployment $dep -n aap27 --type='json' -p="[...]"  # see below
+done
+```
+
+Init containers must have `SKIP_MSSQL` removed and `DJANGO_SETTINGS_MODULE=eda_mssql_settings` set, otherwise they fall back to PG and crash:
+
+```bash
+kubectl patch deployment <eda-deployment> -n aap27 --type='json' -p='[
+  {"op":"replace","path":"/spec/template/spec/initContainers/0/env","value":[
+    {"name":"DJANGO_SETTINGS_MODULE","value":"eda_mssql_settings"},
+    {"name":"PYTHONPATH","value":"/opt/mssql-poc"},
+    {"name":"EDA_SECRET_KEY","valueFrom":{"secretKeyRef":{
+      "name":"myaap-eda-db-fields-encryption-secret","key":"secret_key"}}}
+  ]}
+]'
+```
+
+### 7.5 Shut Down PostgreSQL
+
+```bash
+kubectl scale statefulset myaap-postgres-15 -n aap27 --replicas=0
+```
+
+### 7.6 Verification
+
+After all pods restart:
+
+```bash
+# Confirm no PG pods
+kubectl get pods -n aap27 | grep postgres  # should return nothing
+
+# Controller
+kubectl exec -n aap27 deployment/myaap-controller-web -c myaap-controller-web \
+  -- curl -sk http://localhost:8052/api/v2/ping/
+
+# Gateway
+curl -s http://localhost:44927/api/gateway/v1/ping/
+
+# EDA
+curl -s http://localhost:44927/api/eda/v1/status/
+
+# Verify database engine
+kubectl exec -n aap27 deployment/myaap-controller-web -c myaap-controller-web \
+  -- bash -c "awx-manage shell -c \"
+from django.db import connections
+for alias in ['default','mssql']:
+    c = connections[alias]; c.ensure_connection()
+    print(f'{alias}: {c.vendor} @ {c.settings_dict[\\\"HOST\\\"]}')\""
+```
+
+Expected output for all three components: `ENGINE=microsoft`, `HOST=host.docker.internal`.
+
+### 7.7 Known Issues in PG-Free Mode
+
+| Issue | Impact | Workaround |
+|-------|--------|------------|
+| Controller rsyslog container crash-loops with non-MSSQL image | Pod shows NotReady | Use MSSQL controller image for rsyslog container |
+| Gateway `load_custom_envvars()` overrides `DATABASES['default']` | Default alias points to dead PG | Set `DATABASE_*` env vars to MSSQL values |
+| EDA init containers have `SKIP_MSSQL=1` | Init containers crash trying to connect to PG | Remove `SKIP_MSSQL`, set `DJANGO_SETTINGS_MODULE=eda_mssql_settings` |
+| Gateway `dispatcherd_connected: false` | Non-critical — dispatcherd health check uses different mechanism | Cosmetic only, gateway fully functional |
+| Automation Hub non-functional | Hub has not been migrated to MSSQL | Out of scope for this POC |
+
+---
+
 ## Shared Library: mssql_common.py
 
 The `lib/mssql_common.py` module centralises all reusable MSSQL patches so that controller, gateway, and EDA don't duplicate code. It provides:
@@ -1337,6 +1496,9 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 | **Missing DAB content types** | `RuntimeError: Could not find content type for ('eda', 'core', 'auditrule')` on project create | `post_migrate` signals were disabled during migration — DAB RBAC content types and permissions created by those signals are missing. Copy from PG with `IDENTITY_INSERT ON` (see Part 4.9.1) |
 | **Content type ID mismatch** | `Resource.DoesNotExist` on user create or role assignment in Gateway | `django_content_type` IDs differ between PG and MSSQL. `dab_resource_registry_resource.content_type_id` retains PG values after data copy. Remap to MSSQL IDs (see Part 4.9.2) |
 | **Duplicate Resource entries** | `Resource.MultipleObjectsReturned: get() returned more than one Resource` on login | After fixing content type IDs, duplicate Resource rows exist (original + auto-created). Delete the auto-created duplicate, keep the one matching PG's `ansible_id` (see Part 4.9.3) |
+| **Gateway `load_custom_envvars()` overrides `DATABASES['default']`** | Gateway `default` alias points to dead PG despite redirect in settings file | `aap_gateway_api.settings_utils._CUSTOM_ENVVAR_MAPPINGS` maps `DATABASE_HOST` → `DATABASES__default__HOST` etc. These env vars run AFTER the settings file. Must also set `DATABASE_HOST=host.docker.internal DATABASE_PORT=1433` etc. on the gateway deployment (see Part 7.3) |
+| **EDA init containers have `SKIP_MSSQL=1`** | Init containers crash-loop when PG is down | Init containers were configured to skip MSSQL during initial migration. For PG-free operation, remove `SKIP_MSSQL` and set `DJANGO_SETTINGS_MODULE=eda_mssql_settings` (see Part 7.4) |
+| **Controller rsyslog uses non-MSSQL image** | rsyslog container crash-loops on `wait-for-migrations` | rsyslog container built from base controller image, which connects to PG. Use the MSSQL controller image for this container (see Part 7.2) |
 
 ---
 
@@ -1397,7 +1559,7 @@ Gateway patches use `AppConfig.ready()` replacement instead of `connection_creat
 - **Table partitioning**: SQL Server does not support PostgreSQL-style table partitioning. Migration 0144 is faked; event tables are unpartitioned.
 - **mssql-django maintenance**: The `mssql-django` package (1.7.3) is community-maintained. Production use requires evaluation of long-term support.
 - **Notification latency**: The WAITFOR RECEIVE cycle adds ~20s round-trip for the self-check health probe. Actual message delivery is near-instant when a Service Broker signal wakes the consumer. For production, the WAITFOR timeout could be reduced.
-- **DATABASES['default']**: Django requires a `default` database entry. After killing PG, `default` may need to point at SQL Server too.
+- **DATABASES['default']**: Django requires a `default` database entry. Resolved — see [Part 7: PostgreSQL-Free Operation](#part-7-postgresql-free-operation) for the full fix including the Gateway `load_custom_envvars()` caveat.
 - **cache-clear race condition**: The `run_cache_clear` command imports `pg_bus_conn` before the deferred patch fires, getting the original PubSub with psycopg. Non-critical — it self-recovers on restart.
 - **Gateway `dispatcherd_connected: false`**: The gateway ping endpoint may show `dispatcherd_connected: false`. Non-critical for the POC.
 - **rotate_secret_key.py**: Uses `%s::jsonb` PostgreSQL-specific cast. Not critical (management command, not runtime).
